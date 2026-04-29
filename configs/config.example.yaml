@@ -1,0 +1,38 @@
+# Robot Bridge Configuration
+
+server:
+  host: "0.0.0.0"
+  port: 8082
+  
+  # WebSocket endpoint for ESP32 connections
+  websocket:
+    path: "/ws/robot"
+    ping_interval: 30
+    ping_timeout: 10
+
+# Hermes Gateway connection
+hermes:
+  host: "127.0.0.1"
+  port: 8642
+  api_key: "your-hermes-api-key"
+  timeout: 60
+
+# TTS Configuration
+tts:
+  provider: "edge"
+  voice: "zh-CN-XiaoxiaoNeural"
+  rate: "+10%"
+  volume: "+0%"
+  output_format: "audio-24khz-48kbitrate-mono-mp3"
+
+# Memory configuration (for future use)
+memory:
+  enabled: true
+  provider: "hermes"
+
+# Logging
+log:
+  level: "INFO"
+  file: "logs/bridge.log"
+  rotation: "100 MB"
+  retention: "7 days"
