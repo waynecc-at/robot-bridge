@@ -159,13 +159,13 @@ robot-bridge/
 ├── src/
 │   ├── main.py              # 主入口
 │   ├── config.py            # 配置管理
-│   ├── api.py               # HTTP API
-│   ├── hermes_client.py     # Hermes 客户端
-│   ├── tts_service.py       # Edge TTS
-│   ├── websocket_handler.py  # WebSocket 处理
-│   └── cli.py               # CLI 客户端
+│   ├── api.py              # HTTP API
+│   ├── hermes_client.py    # Hermes 客户端
+│   ├── tts_service.py      # Edge TTS
+│   ├── websocket_handler.py # WebSocket 处理
+│   └── cli.py              # CLI 客户端
 ├── tests/
-│   └── test_bridge.py       # 测试脚本
+│   └── test_bridge.py      # 测试脚本
 ├── logs/                    # 日志目录
 ├── .gitignore
 ├── pyproject.toml
@@ -191,6 +191,18 @@ platforms:
     key: "your-api-key"
 ```
 
+## 引用项目
+
+本项目基于以下开源项目构建：
+
+| 项目 | 说明 | 链接 |
+|------|------|------|
+| **Hermes Agent** | AI Agent 框架，支持长期记忆、技能系统 | [GitHub](https://github.com/hermes-agent/hermes-agent) |
+| **StackChan** | M5Stack 开源桌面机器人 | [GitHub](https://github.com/m5stack/StackChan) |
+| **xiaozhi-esp32** | ESP32 语音对话固件 | [GitHub](https://github.com/78/xiaozhi-esp32) |
+| **Edge TTS** | 微软 Edge 语音合成 Python 客户端 | [PyPI](https://pypi.org/project/edge-tts/) |
+| **FastAPI** | 现代 Python Web 框架 | [GitHub](https://github.com/tiangolo/fastapi) |
+
 ## 隐私说明
 
 - `configs/config.yaml` 不包含在版本控制中
@@ -199,4 +211,4 @@ platforms:
 
 ## License
 
-MIT
+MIT License
