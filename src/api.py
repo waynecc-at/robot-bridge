@@ -10,6 +10,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 
+from .asr_service import asr_service
 from .config import config
 from .hermes_client import hermes_client
 from .tts_service import tts_service
@@ -41,6 +42,7 @@ async def lifespan(app: FastAPI):
 
     logger.info("Robot Bridge API starting...")
     await hermes_client.__aenter__()
+    await asr_service.start()
 
     # Background task to clean up stale WebSocket sessions every 5 minutes
     async def cleanup_loop():

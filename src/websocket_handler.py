@@ -6,6 +6,7 @@ from typing import Optional
 from dataclasses import dataclass
 from loguru import logger
 
+from .asr_service import asr_service
 from .hermes_client import HermesClient
 from .tts_service import tts_service
 
@@ -86,12 +87,30 @@ class RobotWebSocketHandler:
         await self._process_and_respond(session, text)
 
     async def _handle_audio_message(self, session: RobotSession, message: dict):
-        audio_data = message.get("data", "")
-        logger.info(f"[WS] Audio received: {len(audio_data)} bytes")
+        audio_b64 = message.get("data", "")
+        if not audio_b64:
+            logger.warning("[WS] Empty audio data received")
+            return
+
+        audio_bytes = base64.b64decode(audio_b64)
+        logger.info(f"[WS] Audio received: {len(audio_bytes)} bytes")
+
         await self._send_message(session.websocket, {
             "type": "status",
-            "message": "Audio received (simulation mode)"
+            "message": "listening",
+            "action": "listening"
         })
+
+        text = await asr_service.transcribe(audio_bytes)
+        if not text:
+            await self._send_message(session.websocket, {
+                "type": "error",
+                "message": "Speech not recognized"
+            })
+            return
+
+        session.current_text = text
+        await self._process_and_respond(session, text)
 
     async def _handle_vad_message(self, session: RobotSession, message: dict):
         state = message.get("state", "unknown")
