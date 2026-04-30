@@ -18,13 +18,23 @@ hermes:
   api_key: "your-hermes-api-key"
   timeout: 60
 
-# TTS Configuration
+# TTS Configuration (Sherpa-ONNX Matcha local TTS)
 tts:
-  provider: "edge"
-  voice: "zh-CN-XiaoxiaoNeural"
-  rate: "+10%"
-  volume: "+0%"
-  output_format: "audio-24khz-48kbitrate-mono-mp3"
+  provider: "sherpa-onnx"
+  model_dir: "models/matcha-icefall-zh-baker"
+  acoustic_model: "model-steps-3.onnx"
+  vocoder: "vocos-22khz-univ.onnx"
+  tokens: "tokens.txt"
+  lexicon: "lexicon.txt"
+  data_dir: ""
+  rule_fsts:
+    - "phone.fst"
+    - "date.fst"
+    - "number.fst"
+  noise_scale: 0.667
+  length_scale: 1.0
+  speed: 1.0
+  num_threads: 4
 
 # Memory configuration (for future use)
 memory:

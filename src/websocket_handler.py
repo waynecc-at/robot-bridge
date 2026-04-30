@@ -215,6 +215,7 @@ class RobotWebSocketHandler:
                 async for chunk in tts_service.synthesize_stream(buffer.strip()):
                     await self._send_message(session.websocket, {
                         "type": "tts_audio",
+                        "format": "wav",
                         "data": base64.b64encode(chunk).decode(),
                         "final": False
                     })

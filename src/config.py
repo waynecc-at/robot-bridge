@@ -35,11 +35,20 @@ class RobotConfig(BaseModel):
 
 
 class TTSConfig(BaseModel):
-    provider: str = "edge"
-    voice: str = "zh-CN-XiaoxiaoNeural"
-    rate: str = "+10%"
-    volume: str = "+0%"
-    output_format: str = "audio-24khz-48kbitrate-mono-mp3"
+    provider: str = "sherpa-onnx"
+    # Sherpa-ONNX Matcha model paths (relative to model_dir)
+    model_dir: str = "models/matcha-icefall-zh-baker"
+    acoustic_model: str = "model-steps-3.onnx"
+    vocoder: str = "vocos-22khz-univ.onnx"
+    tokens: str = "tokens.txt"
+    lexicon: str = "lexicon.txt"
+    data_dir: str = ""
+    rule_fsts: list[str] = ["phone.fst", "date.fst", "number.fst"]
+    # Generation parameters
+    noise_scale: float = 0.667
+    length_scale: float = 1.0
+    speed: float = 1.0
+    num_threads: int = 4
 
 
 class MemoryConfig(BaseModel):

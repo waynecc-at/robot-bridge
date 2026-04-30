@@ -38,6 +38,11 @@ Thumbs.db
 *.wav
 *.ogg
 
+# TTS/ASR Models (large files, download separately)
+models/
+*.onnx
+*.tar.bz2
+
 # Temporary
 tmp/
 temp/

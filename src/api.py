@@ -43,6 +43,7 @@ async def lifespan(app: FastAPI):
     logger.info("Robot Bridge API starting...")
     await hermes_client.__aenter__()
     await asr_service.start()
+    await tts_service.start()
 
     # Background task to clean up stale WebSocket sessions every 5 minutes
     async def cleanup_loop():
@@ -124,7 +125,7 @@ async def chat(request: ChatRequest):
 
 
 async def stream_chat_response(message: str, session_id: Optional[str]):
-    """Stream chat response with TTS audio"""
+    """Stream chat response with TTS audio (WAV format)"""
     async with hermes_client as hermes:
         # Get Hermes response
         response = await hermes.chat(
@@ -141,15 +142,16 @@ async def stream_chat_response(message: str, session_id: Optional[str]):
             "text": response_text,
             "session_id": response.session_id
         }) + "\n"
-        
-        # Then stream TTS audio
+
+        # Then stream TTS audio (WAV chunks)
         async for chunk in tts_service.synthesize_stream(response_text):
             yield json.dumps({
                 "type": "audio",
+                "format": "wav",
                 "data": base64.b64encode(chunk).decode(),
                 "final": False
             }) + "\n"
-        
+
         # Final marker
         yield json.dumps({
             "type": "audio",
@@ -174,9 +176,9 @@ async def synthesize_speech(request: TTSRequest):
     
     return StreamingResponse(
         iter([audio]),
-        media_type="audio/mpeg",
+        media_type="audio/wav",
         headers={
-            "Content-Disposition": f"attachment; filename=tts_{uuid.uuid4().hex[:8]}.mp3"
+            "Content-Disposition": f"attachment; filename=tts_{uuid.uuid4().hex[:8]}.wav"
         }
     )
 
@@ -197,7 +199,7 @@ async def synthesize_speech_stream(request: TTSRequest):
     
     return StreamingResponse(
         generate(),
-        media_type="audio/mpeg"
+        media_type="audio/wav"
     )
 
 
