@@ -115,6 +115,7 @@ async def chat(request: ChatRequest):
         response = await hermes.chat(
             message=request.message,
             session_id=request.session_id,
+            system_prompt=config.robot.system_prompt,
         )
         return JSONResponse({
             "text": response.text,
@@ -129,10 +130,11 @@ async def stream_chat_response(message: str, session_id: Optional[str]):
         response = await hermes.chat(
             message=message,
             session_id=session_id,
+            system_prompt=config.robot.system_prompt,
         )
-        
+
         response_text = response.text
-        
+
         # Send text first
         yield json.dumps({
             "type": "text",

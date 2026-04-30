@@ -1,5 +1,6 @@
 """WebSocket handler for robot connections"""
 import json
+import re
 import time
 import base64
 from typing import Optional
@@ -7,6 +8,7 @@ from dataclasses import dataclass
 from loguru import logger
 
 from .asr_service import asr_service
+from .config import config
 from .hermes_client import HermesClient
 from .tts_service import tts_service
 
@@ -145,42 +147,86 @@ class RobotWebSocketHandler:
             })
 
             logger.info(f"[WS] Processing: {text}")
-            response = await self.hermes.chat(
+
+            # Stream tokens from Hermes, split on sentence boundaries
+            buffer = ""
+            sentence_count = 0
+            full_text = ""
+
+            async for token in self.hermes.chat_stream(
                 message=text,
                 session_id=session.session_id,
-            )
+                system_prompt=config.robot.system_prompt,
+            ):
+                buffer += token
 
-            response_text = response.text
-            logger.info(f"[WS] Hermes response: {response_text[:100]}...")
+                # Check for sentence boundary
+                m = re.search(r"(.+?[。！？\n])", buffer)
+                if m:
+                    sentence = m.group(1).strip()
+                    before = buffer[:m.end()]
+                    after = buffer[m.end():]
+                    buffer = after
+                    full_text += before
 
-            await self._send_message(session.websocket, {
-                "type": "response_text",
-                "text": response_text,
-                "session_id": session.session_id
-            })
+                    sentence_count += 1
+                    logger.info(f"[WS] Sentence {sentence_count}: {sentence[:60]}")
 
-            await self._send_message(session.websocket, {
-                "type": "status",
-                "message": "synthesizing",
-                "action": "speaking"
-            })
+                    # Send sentence text
+                    await self._send_message(session.websocket, {
+                        "type": "response_text",
+                        "text": sentence,
+                        "session_id": session.session_id,
+                        "partial": True
+                    })
 
-            audio_chunks = []
-            async for chunk in tts_service.synthesize_stream(response_text):
-                audio_chunks.append(chunk)
+                    # Stream TTS for this sentence immediately
+                    await self._send_message(session.websocket, {
+                        "type": "status",
+                        "message": "speaking",
+                        "action": "speaking"
+                    })
+
+                    async for chunk in tts_service.synthesize_stream(sentence):
+                        await self._send_message(session.websocket, {
+                            "type": "tts_audio",
+                            "data": base64.b64encode(chunk).decode(),
+                            "final": False
+                        })
+
+            # Any remaining text in buffer (last sentence without punctuation)
+            if buffer.strip():
+                full_text += buffer
+                sentence_count += 1
+
                 await self._send_message(session.websocket, {
-                    "type": "tts_audio",
-                    "data": base64.b64encode(chunk).decode(),
-                    "final": False
+                    "type": "response_text",
+                    "text": buffer.strip(),
+                    "session_id": session.session_id,
+                    "partial": True
                 })
 
+                await self._send_message(session.websocket, {
+                    "type": "status",
+                    "message": "speaking",
+                    "action": "speaking"
+                })
+
+                async for chunk in tts_service.synthesize_stream(buffer.strip()):
+                    await self._send_message(session.websocket, {
+                        "type": "tts_audio",
+                        "data": base64.b64encode(chunk).decode(),
+                        "final": False
+                    })
+
+            # Final marker
             await self._send_message(session.websocket, {
                 "type": "tts_audio",
                 "data": "",
                 "final": True
             })
 
-            logger.info(f"[WS] TTS complete, streamed {len(audio_chunks)} chunks")
+            logger.info(f"[WS] Stream complete: {sentence_count} sentences")
 
         except Exception as e:
             logger.error(f"[WS] Processing error: {e}")

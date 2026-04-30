@@ -145,10 +145,13 @@ class HermesClient:
 
                         try:
                             data = json.loads(data_str)
-                            if "text" in data:
-                                chunk = data["text"]
-                                full_text += chunk
-                                yield chunk
+                            choices = data.get("choices", [])
+                            if choices:
+                                delta = choices[0].get("delta", {})
+                                chunk = delta.get("content", "")
+                                if chunk:
+                                    full_text += chunk
+                                    yield chunk
                         except json.JSONDecodeError:
                             continue
 

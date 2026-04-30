@@ -25,6 +25,15 @@ class HermesConfig(BaseModel):
         return f"http://{self.host}:{self.port}"
 
 
+class RobotConfig(BaseModel):
+    system_prompt: str = (
+        "你是 StackChan，一个语音机器人助手。回复规则："
+        "用口语化中文，像朋友聊天；每句不超过15字；"
+        "不要输出 markdown、列表或内部记忆；"
+        "确认类回复只需一个字。"
+    )
+
+
 class TTSConfig(BaseModel):
     provider: str = "edge"
     voice: str = "zh-CN-XiaoxiaoNeural"
@@ -48,6 +57,7 @@ class LogConfig(BaseModel):
 class Config(BaseModel):
     server: ServerConfig = ServerConfig()
     hermes: HermesConfig = HermesConfig()
+    robot: RobotConfig = RobotConfig()
     tts: TTSConfig = TTSConfig()
     memory: MemoryConfig = MemoryConfig()
     log: LogConfig = LogConfig()
