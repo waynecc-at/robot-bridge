@@ -1,15 +1,13 @@
 """Robot Bridge - Main Entry Point"""
-import asyncio
 import sys
 import signal
 from pathlib import Path
 from loguru import logger
 
 import uvicorn
-from uvicorn.config import Config
 
+from .api import app
 from .config import config
-from .hermes_client import HermesClient
 
 
 def setup_logging():
@@ -39,39 +37,16 @@ def setup_logging():
     logger.info(f"Logging configured, level={config.log.level}")
 
 
-async def check_hermes_connection():
-    """Check if Hermes Gateway is reachable"""
-    logger.info(f"[Init] Checking Hermes connection at {config.hermes.base_url}...")
-    
-    try:
-        async with HermesClient() as hermes:
-            healthy = await hermes.check_health()
-            if healthy:
-                logger.info("[Init] Hermes Gateway is healthy")
-                return True
-            else:
-                logger.warning("[Init] Hermes Gateway health check failed")
-                return False
-    except Exception as e:
-        logger.error(f"[Init] Cannot connect to Hermes Gateway: {e}")
-        logger.warning("[Init] Continuing anyway - Hermes may start later")
-        return False
-
-
 def run_server():
     """Run the Robot Bridge server"""
     setup_logging()
-    
+
     logger.info("=" * 60)
     logger.info("Robot Bridge - StackChan to Hermes Gateway Bridge")
     logger.info("=" * 60)
-    
-    # Check Hermes connection
-    asyncio.run(check_hermes_connection())
-    
-    # Server configuration
+
     server_config = uvicorn.Config(
-        "src.api:app",
+        app=app,
         host=config.server.host,
         port=config.server.port,
         log_level="info",

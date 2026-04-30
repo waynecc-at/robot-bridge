@@ -1,7 +1,5 @@
 """Text-to-Speech Service using Edge TTS"""
-import asyncio
 import base64
-import io
 from typing import AsyncGenerator, Optional
 from loguru import logger
 import edge_tts

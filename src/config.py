@@ -1,4 +1,5 @@
 """Configuration management"""
+import os
 from pathlib import Path
 from typing import Optional
 from pydantic import BaseModel
@@ -16,7 +17,7 @@ class ServerConfig(BaseModel):
 class HermesConfig(BaseModel):
     host: str = "127.0.0.1"
     port: int = 13001
-    api_key: str = "robot-bridge-secret-2026"
+    api_key: str = os.getenv("HERMES_API_KEY", "")
     timeout: int = 60
 
     @property

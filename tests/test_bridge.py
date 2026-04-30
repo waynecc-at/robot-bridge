@@ -7,8 +7,8 @@ import websockets
 from pathlib import Path
 
 
-BASE_URL = "http://127.0.0.1:8081"
-WS_URL = "ws://127.0.0.1:8081/ws/robot"
+BASE_URL = "http://127.0.0.1:8083"
+WS_URL = "ws://127.0.0.1:8083/ws/robot"
 
 
 async def test_health():

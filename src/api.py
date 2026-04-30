@@ -1,6 +1,6 @@
 """HTTP API Server for Robot Bridge"""
-import asyncio
 import base64
+import json
 import uuid
 from typing import Optional
 from contextlib import asynccontextmanager
@@ -11,7 +11,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 
 from .config import config
-from .hermes_client import HermesClient
+from .hermes_client import hermes_client
 from .tts_service import tts_service
 
 
@@ -36,8 +36,24 @@ class WebSocketMessage(BaseModel):
 # Lifespan for startup/shutdown
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    import asyncio
+    from .websocket_handler import ws_handler
+
     logger.info("Robot Bridge API starting...")
+    await hermes_client.__aenter__()
+
+    # Background task to clean up stale WebSocket sessions every 5 minutes
+    async def cleanup_loop():
+        while True:
+            await asyncio.sleep(300)
+            await ws_handler.cleanup_stale_sessions()
+
+    cleanup_task = asyncio.create_task(cleanup_loop())
+
     yield
+
+    cleanup_task.cancel()
+    await hermes_client.close()
     logger.info("Robot Bridge API shutting down...")
 
 
@@ -55,7 +71,7 @@ app = FastAPI(
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
-    async with HermesClient() as hermes:
+    async with hermes_client as hermes:
         hermes_healthy = await hermes.check_health()
     
     return {
@@ -86,38 +102,27 @@ async def root():
 
 @app.post("/api/chat")
 async def chat(request: ChatRequest):
-    """
-    Send a chat message and get text response
-    
-    For simulation/testing without real ESP32 device
-    """
-    async with HermesClient() as hermes:
+    if request.stream:
+        return StreamingResponse(
+            stream_chat_response(request.message, request.session_id),
+            media_type="application/json"
+        )
+
+    async with hermes_client as hermes:
         logger.info(f"[API] Chat request: {request.message[:50]}...")
-        
-        if request.stream:
-            # Stream response with TTS
-            return StreamingResponse(
-                stream_chat_response(request.message, request.session_id),
-                media_type="application/json"
-            )
-        else:
-            # Simple text response
-            response = await hermes.chat(
-                message=request.message,
-                session_id=request.session_id,
-            )
-            
-            return JSONResponse({
-                "text": response.text,
-                "session_id": response.session_id,
-            })
+        response = await hermes.chat(
+            message=request.message,
+            session_id=request.session_id,
+        )
+        return JSONResponse({
+            "text": response.text,
+            "session_id": response.session_id,
+        })
 
 
 async def stream_chat_response(message: str, session_id: Optional[str]):
     """Stream chat response with TTS audio"""
-    import json
-    
-    async with HermesClient() as hermes:
+    async with hermes_client as hermes:
         # Get Hermes response
         response = await hermes.chat(
             message=message,
@@ -232,26 +237,23 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info("[WS] WebSocket client connected")
     
-    hermes = HermesClient()
-    async with hermes:
-        await ws_handler.set_hermes_client(hermes)
-        
-        try:
-            while True:
-                data = await websocket.receive_text()
-                logger.debug(f"[WS] Received: {data[:100]}...")
-                
-                # Handle the message
-                session_id = "http_client"
-                await ws_handler._handle_message(
-                    RobotSession(websocket, session_id),
-                    data
-                )
-                
-        except WebSocketDisconnect:
-            logger.info("[WS] WebSocket client disconnected")
-        except Exception as e:
-            logger.error(f"[WS] Error: {e}")
+    await ws_handler.set_hermes_client(hermes_client)
+
+    try:
+        while True:
+            data = await websocket.receive_text()
+            logger.debug(f"[WS] Received: {data[:100]}...")
+
+            session_id = "http_client"
+            await ws_handler._handle_message(
+                RobotSession(websocket, session_id),
+                data
+            )
+
+    except WebSocketDisconnect:
+        logger.info("[WS] WebSocket client disconnected")
+    except Exception as e:
+        logger.error(f"[WS] Error: {e}")
 
 
 class RobotSession:
@@ -259,41 +261,3 @@ class RobotSession:
     def __init__(self, websocket: WebSocket, session_id: str):
         self.websocket = websocket
         self.session_id = session_id
-    
-    async def _handle_message(self, session, raw_message):
-        """Forward to handler"""
-        message = json.loads(raw_message)
-        msg_type = message.get("type", "unknown")
-        
-        if msg_type == "text":
-            text = message.get("text", "")
-            
-            # Get Hermes response
-            response = await session.hermes.chat(
-                message=text,
-                session_id=self.session_id,
-            )
-            
-            # Send text response
-            await self.websocket.send_json({
-                "type": "response_text",
-                "text": response.text,
-                "session_id": response.session_id
-            })
-            
-            # Stream TTS
-            async for chunk in tts_service.synthesize_stream(response.text):
-                await self.websocket.send_json({
-                    "type": "tts_audio",
-                    "data": base64.b64encode(chunk).decode(),
-                    "final": False
-                })
-            
-            await self.websocket.send_json({
-                "type": "tts_audio",
-                "data": "",
-                "final": True
-            })
-
-
-import json

@@ -1,12 +1,7 @@
 """Simple CLI client for testing Robot Bridge"""
 import asyncio
-import sys
-import base64
-import json
 import os
 import argparse
-
-from loguru import logger
 
 
 class RobotBridgeCLI:

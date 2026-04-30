@@ -2,13 +2,10 @@
 
 server:
   host: "0.0.0.0"
-  port: 8082
-  
-  # WebSocket endpoint for ESP32 connections
-  websocket:
-    path: "/ws/robot"
-    ping_interval: 30
-    ping_timeout: 10
+  port: 8081
+  websocket_path: "/ws/robot"
+  ping_interval: 30
+  ping_timeout: 10
 
 # Hermes Gateway connection
 hermes:

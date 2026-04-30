@@ -11,8 +11,8 @@ dependencies = [
     "httpx>=0.26.0",
     "pydantic>=2.5.0",
     "python-dotenv>=1.0.0",
+    "pyyaml>=6.0",
     "loguru>=0.7.0",
-    "asyncio-mqtt>=0.16.0",
 ]
 
 [project.optional-dependencies]
