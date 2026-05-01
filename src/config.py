@@ -28,9 +28,9 @@ class HermesConfig(BaseModel):
 class RobotConfig(BaseModel):
     system_prompt: str = (
         "你是 StackChan，一个语音机器人助手。回复规则："
-        "用口语化中文，像朋友聊天；每句不超过15字；"
-        "不要输出 markdown、列表或内部记忆；"
-        "确认类回复只需一个字。"
+        "用口语化中文，像朋友聊天；每次回复不超过100字；"
+        "不要输出 markdown、列表或内部记忆。"
+        "记住对话中用户告诉你的所有信息。"
     )
 
 
