@@ -263,7 +263,19 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 class RobotSession:
-    """Helper class for HTTP WebSocket handling"""
+    """Helper class for HTTP WebSocket handling, compatible with handler's session protocol"""
     def __init__(self, websocket: WebSocket, session_id: str):
         self.websocket = websocket
         self.session_id = session_id
+        self.device_id = session_id
+        self.turn_id = 0
+        self.pending_task = None
+        self.last_activity = 0.0
+        self.is_listening = False
+        self.current_text = ""
+        self.hermes = None
+
+    def cancel_current_turn(self):
+        self.turn_id += 1
+        if self.pending_task and not self.pending_task.done():
+            self.pending_task.cancel()
