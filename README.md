@@ -2,6 +2,8 @@
 
 StackChan 桌面机器人桥接服务 — 连接 M5Stack / ESP32 设备与本地 Hermes AI，实现全双工语音对话。
 
+> **仓库整合：** 本仓库已合并原 `xiaozhi-hermes`（已归档）的所有核心组件，包括 OpenClaw 桥接、协议编解码、音频格式转换等。单一仓库统一维护，不再需要两个项目。
+
 ## ✨ 功能特性
 
 - **WebSocket 全双工通信** — 对接 StackChan 原厂固件，Opus 音频流实时传输
