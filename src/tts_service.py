@@ -1,12 +1,25 @@
-"""Text-to-Speech Service using Sherpa-ONNX Matcha TTS"""
+"""Text-to-Speech Service using Sherpa-ONNX Matcha TTS
+
+Optimizations:
+- Thread pool offloading: CPU-bound inference runs in executor, not event loop
+- Chunked streaming: splits WAV into 200ms chunks, first chunk at 50ms for instant playback
+"""
+import asyncio
+import base64
 import io
 import struct
 import wave
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import AsyncGenerator, Optional
 from loguru import logger
 
 from .config import config
+
+
+# Default chunk parameters
+PREBUFFER_CHUNK_MS = 50    # First chunk: 50ms for fastest playback start
+STREAM_CHUNK_MS = 200      # Subsequent chunks: 200ms each
 
 
 class TTSService:
@@ -16,6 +29,11 @@ class TTSService:
         self._tts = None
         self._sample_rate = 22050
         self._ready = False
+        self._executor: Optional[ThreadPoolExecutor] = None
+
+    def set_executor(self, executor: ThreadPoolExecutor):
+        """Inject shared thread pool for CPU-bound inference"""
+        self._executor = executor
 
     async def start(self):
         """Initialize the Sherpa-ONNX TTS engine"""
@@ -81,7 +99,7 @@ class TTSService:
 
         logger.info(f"[TTS] Synthesizing: {text[:50]}...")
 
-        audio = self._generate(text)
+        audio = await self._generate(text)
         wav_bytes = self._samples_to_wav(audio.samples, audio.sample_rate)
 
         logger.info(f"[TTS] Generated {len(wav_bytes)} bytes of WAV audio "
@@ -93,18 +111,61 @@ class TTSService:
         text: str,
         voice: Optional[str] = None,
     ) -> AsyncGenerator[bytes, None]:
-        """Synthesize text to audio, yield complete WAV as one chunk"""
+        """Synthesize text to audio, yield chunked WAV for streaming playback.
+
+        First chunk is PREBUFFER_CHUNK_MS (50ms) for instant playback start.
+        Subsequent chunks are STREAM_CHUNK_MS (200ms) each.
+        CPU-bound inference runs in thread pool to avoid blocking event loop.
+        """
         if not self._ready:
             raise RuntimeError("TTS service not initialized")
 
         logger.info(f"[TTS] Streaming synthesis: {text[:50]}...")
 
-        audio = self._generate(text)
-        wav_bytes = self._samples_to_wav(audio.samples, audio.sample_rate)
+        # Run CPU-bound inference in thread pool (not event loop)
+        audio = await self._generate(text)
+        sr = audio.sample_rate
+        samples = audio.samples
 
-        yield wav_bytes
+        total_duration = len(samples) / sr
+        logger.info(f"[TTS] Generated {len(samples)} samples ({total_duration:.2f}s)")
 
-        logger.info(f"[TTS] Yielded {len(wav_bytes)} bytes of WAV audio")
+        # Build full WAV once, then yield chunked views into it
+        wav_bytes = self._samples_to_wav(samples, sr)
+        wav_data = wav_bytes[44:]  # Skip WAV header (44 bytes), keep PCM data
+        wav_sr = sr
+        bytes_per_sample = 2  # 16-bit PCM
+
+        # Chunk size calculations
+        prebuffer_bytes = int(wav_sr * (PREBUFFER_CHUNK_MS / 1000) * bytes_per_sample)
+        chunk_bytes = int(wav_sr * (STREAM_CHUNK_MS / 1000) * bytes_per_sample)
+
+        # Rebuild minimal WAV header for chunks
+        def _make_wav_chunk(pcm_chunk: bytes) -> bytes:
+            buf = io.BytesIO()
+            with wave.open(buf, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(wav_sr)
+                wf.writeframes(pcm_chunk)
+            return buf.getvalue()
+
+        # First chunk: smallest viable for fastest playback start
+        first_pcm = wav_data[:prebuffer_bytes]
+        if first_pcm:
+            yield _make_wav_chunk(first_pcm)
+
+        # Remaining chunks
+        offset = prebuffer_bytes
+        while offset < len(wav_data):
+            chunk_pcm = wav_data[offset:offset + chunk_bytes]
+            if not chunk_pcm:
+                break
+            yield _make_wav_chunk(chunk_pcm)
+            offset += chunk_bytes
+
+        logger.info(f"[TTS] Streamed {len(wav_bytes)} bytes in chunks "
+                    f"(first={PREBUFFER_CHUNK_MS}ms, chunk={STREAM_CHUNK_MS}ms)")
 
     async def synthesize_to_base64(
         self,
@@ -112,7 +173,6 @@ class TTSService:
         voice: Optional[str] = None,
     ) -> str:
         """Synthesize and return base64 encoded audio"""
-        import base64
         audio = await self.synthesize(text, voice)
         return base64.b64encode(audio).decode("utf-8")
 
@@ -125,12 +185,23 @@ class TTSService:
             "Gender": "Female",
         }]
 
-    def _generate(self, text: str):
-        """Generate audio samples for text"""
-        gen_config = __import__("sherpa_onnx").GenerationConfig()
+    async def _generate(self, text: str):
+        """Generate audio samples in thread pool to avoid blocking event loop"""
+        import sherpa_onnx
+        loop = asyncio.get_event_loop()
+        executor = self._executor
+
+        gen_config = sherpa_onnx.GenerationConfig()
         gen_config.sid = 0
         gen_config.speed = config.tts.speed
-        return self._tts.generate(text, gen_config)
+
+        def _do_generate():
+            return self._tts.generate(text, gen_config)
+
+        if executor:
+            return await loop.run_in_executor(executor, _do_generate)
+        else:
+            return await loop.run_in_executor(None, _do_generate)
 
     @staticmethod
     def _samples_to_wav(samples: list, sample_rate: int) -> bytes:

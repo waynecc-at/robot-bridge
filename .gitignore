@@ -47,3 +47,16 @@ models/
 tmp/
 temp/
 *.tmp
+
+# Secrets (duplicate protection)
+*.key
+*.pem
+*.cert
+credentials.json
+service-account.json
+
+# myapp-channel node_modules
+myapp-channel-0.1.0/node_modules/
+
+# Robot Bridge specific logs
+bridge.log*

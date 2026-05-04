@@ -10,15 +10,17 @@ class ServerConfig(BaseModel):
     host: str = "0.0.0.0"
     port: int = 8081
     websocket_path: str = "/ws/robot"
-    ping_interval: int = 30
+    ping_interval: int = 15
     ping_timeout: int = 10
 
 
 class HermesConfig(BaseModel):
     host: str = "127.0.0.1"
-    port: int = 13001
+    port: int = 8642  # Hermes Gateway API port (not xiaozhi-hermes proxy port)
     api_key: str = os.getenv("HERMES_API_KEY", "")
     timeout: int = 60
+    first_token_timeout: int = 30  # s, max wait for first stream token
+    model: str = "hermes-agent"   # model name sent in API payload
 
     @property
     def base_url(self) -> str:
@@ -48,12 +50,17 @@ class TTSConfig(BaseModel):
     noise_scale: float = 0.667
     length_scale: float = 1.0
     speed: float = 1.0
-    num_threads: int = 4
+    num_threads: int = 2
+    # Chunked streaming
+    prebuffer_chunk_ms: int = 50
+    stream_chunk_ms: int = 200
 
 
 class MemoryConfig(BaseModel):
     enabled: bool = True
     provider: str = "hermes"
+    idle_compress_interval: int = 30  # seconds between idel compression sweeps
+    compress_threshold: float = 0.65  # fraction of MAX_TOKENS to trigger
 
 
 class LogConfig(BaseModel):

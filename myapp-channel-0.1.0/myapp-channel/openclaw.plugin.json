@@ -1,0 +1,12 @@
+{
+  "id": "myapp-channel",
+  "name": "MyApp Channel",
+  "description": "Outbound WebSocket bridge channel plugin for custom app integration.",
+  "version": "0.1.0",
+  "channels": ["myapp-channel"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

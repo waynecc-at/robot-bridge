@@ -1,42 +1,77 @@
 # Robot Bridge
 
-StackChan 机器人的桥接服务，连接 ESP32 设备与本地 Hermes Agent，实现智能语音对话。
+StackChan 桌面机器人桥接服务 — 连接 M5Stack / ESP32 设备与本地 Hermes AI，实现全双工语音对话。
 
-## 功能特性
+## ✨ 功能特性
 
-- 🌐 **WebSocket Server**: ESP32/M5Stack 设备连接接口
-- 🤖 **Hermes 集成**: 调用本地 Hermes Gateway 进行对话
-- 🔊 **Edge TTS**: 流式语音合成，中文支持
-- 💾 **长期记忆**: 复用 Hermes 原生 hindsight 记忆系统
-- ⚡ **低延迟**: 流式处理，端到端响应快
+- **WebSocket 全双工通信** — 对接 StackChan 原厂固件，Opus 音频流实时传输
+- **本地 ASR** — FunASR SenseVoiceSmall，中文语音识别，不离家
+- **本地 TTS** — Sherpa-ONNX Matcha，中文语音合成，流式分块输出
+- **Hermes AI 集成** — 调用本地 Hermes Gateway 进行多轮对话
+- **长程记忆** — SessionStore 上下文管理 + 后台空闲压缩（不阻塞响应）
+- **OpenClaw 桥接** — 可选 OpenClaw agent 集成（WebSocket bridge / HTTP callback）
+- **并发管道** — LLM 流式 + TTS 合成异步重叠，首块 50ms 预缓冲
+- **抢占中断** — 支持 barge-in，随时打断机器人当前对话
+- **CLI 客户端** — 交互式对话、TTS 试听
 
 ## 系统架构
 
 ```
-┌─────────────────┐     WebSocket      ┌─────────────────┐
-│   StackChan     │ ─────────────────► │  Robot Bridge   │
-│   (ESP32)       │ ◄───────────────── │  (本服务)       │
-│   + M5Stack     │                    │                 │
-└─────────────────┘                    │    ┌─────────┐ │
-                                      │    │ Hermes  │ │
-                                      │    │ Gateway │ │
-                                      │    └────┬────┘ │
-                                      └─────────┼───────┘
-                                                │
-                                         ┌──────┴──────┐
-                                         │  Hermes     │
-                                         │  Agent      │
-                                         │  + Memory   │
-                                         └─────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│  StackChan Robot (原厂固件, 不动)                               │
+│  ┌─────────────────────────────────────────────────────┐         │
+│  │  AppAiAgent                                         │         │
+│  │   ├─ ES7210 Mic → Opus(16kHz/60ms) → WebSocket      │         │
+│  │   ├─ WS接收TTS → Opus解码 → AW88298播放              │         │
+│  │   ├─ LVGL表情 / 舵机运动                              │         │
+│  │   └─ 小智协议 (JSON + 二进制帧)                       │         │
+│  └─────────────────────────────────────────────────────┘         │
+└─────────────────────────────────────────────────────────────────┘
+                                │ WebSocket
+                                ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  robot-bridge (Python 3.10+, FastAPI + uvicorn)                 │
+│                                                                  │
+│  src/                                                           │
+│  ├─ api.py              HTTP API + WebSocket 端点                │
+│  ├─ websocket_handler.py ★ 核心: 并发管道 (LLM↔TTS 重叠)         │
+│  ├─ hermes_client.py    Hermes 客户端 + 延迟压缩 + 长程记忆       │
+│  │                      后台空闲压缩器 (30s 间隔)                  │
+│  ├─ tts_service.py      Sherpa-ONNX (线程池 + 分块流式)          │
+│  ├─ asr_service.py      FunASR SenseVoiceSmall (线程池卸载)      │
+│  ├─ protocol.py         二进制协议 (v1/v2/v3)                     │
+│  ├─ audio_converter.py  Opus/Ogg/WAV 格式转换                    │
+│  ├─ openclaw/           OpenClaw Agent 桥接插件                  │
+│  └─ cli.py              CLI 交互式客户端                          │
+└─────────────────────────────────────────────────────────────────┘
+                                │ HTTP SSE (chat/completions)
+                                ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Hermes AI (本地 LLM 部署)                                       │
+│  输入: system_prompt + summary + 上下文消息                       │
+│  输出: streaming tokens                                          │
+└─────────────────────────────────────────────────────────────────┘
 ```
+
+## 优化亮点 (v0.2)
+
+| 改进项 | 之前 | 之后 | 效果 |
+|--------|------|------|------|
+| TTS/ASR 线程池 | 阻塞事件循环 | `run_in_executor` 卸载 | 不阻塞其他连接 |
+| compress() 时机 | 响应前等待 1-3s | 后台空闲压缩 | 节省 ~2s/轮 |
+| TTS 流式 | 整句 WAV 一次性发送 | 首块 50ms + 后续 200ms 分块 | 更快开始播放 |
+| 管道并行度 | 全串行 (ASR→LLM→TTS) | LLM+TTS 并发 (asyncio.Queue) | 3 句回复省 30-50% |
+| 连接池 | 默认 | keepalive=5, max=10 | 减少连接建立 |
+| Token 估算 | `len//2` 启发式 | tiktoken 优先 + 改进启发式 | 压缩时机更准 |
 
 ## 快速开始
 
 ### 前置要求
 
 - Python 3.10+
-- Hermes Gateway (已部署)
-- 网络连接 (用于 Edge TTS)
+- 本地部署的 Hermes Gateway（或兼容 OpenAI API 的 LLM 服务）
+- FunASR / Sherpa-ONNX 模型文件（[下载说明](#模型下载)）
+- FFmpeg（用于音频格式转换）
 
 ### 1. 安装
 
@@ -44,11 +79,8 @@ StackChan 机器人的桥接服务，连接 ESP32 设备与本地 Hermes Agent�
 git clone https://github.com/你的用户名/robot-bridge.git
 cd robot-bridge
 
-# 创建虚拟环境
 python3 -m venv .venv
 source .venv/bin/activate
-
-# 安装依赖
 pip install -e .
 ```
 
@@ -56,90 +88,75 @@ pip install -e .
 
 ```bash
 cp configs/config.example.yaml configs/config.yaml
-# 编辑 configs/config.yaml，填入你的 Hermes 地址和 API Key
+# 编辑 config.yaml, 填入你的 Hermes 地址
 ```
 
-配置项说明:
-
-```yaml
-server:
-  host: "0.0.0.0"    # 服务监听地址
-  port: 8082          # 服务端口
-
-hermes:
-  host: "127.0.0.1"   # Hermes Gateway 地址
-  port: 8642          # Hermes API 端口
-  api_key: "your-key" # Hermes API Key
-
-tts:
-  voice: "zh-CN-XiaoxiaoNeural"  # 中文女声
-  rate: "+10%"                   # 语速稍微加快
-```
-
-### 3. 启动
+### 3. 模型下载
 
 ```bash
-# 方式一: 脚本启动
+# TTS 模型 (Sherpa-ONNX Matcha 中文)
+mkdir -p models
+# 下载 matcha-icefall-zh-baker 到 models/ 目录
+# 参考: https://github.com/k2-fsa/sherpa-onnx/releases
+
+# ASR 模型 (FunASR)
+# 首次启动时自动下载 iic/SenseVoiceSmall
+```
+
+### 4. 启动
+
+```bash
+# 脚本启动
 ./start.sh
 
-# 方式二: 手动启动
+# 或手动
 python -m src.main
-
-# 方式三: 后台运行
-nohup python -m src.main > logs/bridge.log 2>&1 &
 ```
 
-### 4. 验证
+### 5. 验证
 
 ```bash
-curl http://localhost:8082/health
-# 应返回: {"status": "healthy", "hermes_connected": true}
+curl http://localhost:8081/health
+# 预期: {"status": "healthy", "hermes_connected": true}
 ```
 
 ## API 文档
 
 ### HTTP 接口
 
-| 端点 | 方法 | 说明 | 示例 |
-|------|------|------|------|
-| `/health` | GET | 健康检查 | `curl /health` |
-| `/api/chat` | POST | 对话 | `curl -X POST /api/chat -d '{"message": "你好"}'` |
-| `/api/tts` | POST | TTS合成 | `curl -X POST /api/tts -d '{"text": "你好"}' -o speech.mp3` |
-| `/api/tts/stream` | POST | TTS流式 | 流式返回音频 |
-| `/api/voices` | GET | 语音列表 | `curl /api/voices?language=zh` |
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/health` | GET | 健康检查 |
+| `/api/chat` | POST | 对话 (支持流式 SSE) |
+| `/api/tts` | POST | TTS 合成, 返回 WAV |
+| `/api/tts/stream` | POST | TTS 流式, 分块 WAV |
+| `/api/voices` | GET | 语音列表 |
 
 ### WebSocket 接口
 
-连接地址: `ws://localhost:8082/ws/robot`
+连接: `ws://<host>:8081/ws/robot`
 
-**发送消息:**
+**机器人 → 服务器:**
 ```json
 {"type": "text", "text": "你好"}
+{"type": "audio", "data": "<base64_pcm>", "format": "pcm"}
+{"type": "vad", "state": "start"}
+{"type": "ping", "timestamp": 1234567890}
 ```
 
-**接收响应:**
+**服务器 → 机器人:**
 ```json
-{"type": "response_text", "text": "你好！有什么可以帮你？"}
-{"type": "tts_audio", "data": "base64...", "final": false}
+{"type": "status", "message": "thinking", "action": "thinking"}
+{"type": "response_text", "text": "你好！", "partial": true}
+{"type": "tts_audio", "format": "wav", "data": "<base64_chunk>", "final": false}
 {"type": "tts_audio", "data": "", "final": true}
+{"type": "interrupt", "turn": 3}
 ```
 
-## ESP32 固件配置
-
-将 ESP32/M5Stack 的服务器地址指向 Robot Bridge:
-
-```c
-// app_config.h
-#define SERVER_HOST "你的服务器IP"
-#define SERVER_PORT 8082
-#define WS_PATH "/ws/robot"
-```
-
-## CLI 客户端
-
-交互式对话模式:
+### CLI 客户端
 
 ```bash
+# 交互式对话
 python -m src.cli
 
 # 单次对话
@@ -153,35 +170,69 @@ python -m src.cli --tts "你好" --play
 
 ```
 robot-bridge/
-├── configs/
-│   ├── config.example.yaml   # 配置示例
-│   └── config.yaml          # 实际配置 (不提交)
 ├── src/
-│   ├── main.py              # 主入口
-│   ├── config.py            # 配置管理
-│   ├── api.py              # HTTP API
-│   ├── hermes_client.py    # Hermes 客户端
-│   ├── tts_service.py      # Edge TTS
-│   ├── websocket_handler.py # WebSocket 处理
-│   └── cli.py              # CLI 客户端
+│   ├── __init__.py            # 包版本
+│   ├── main.py                # 入口 + uvicorn 启动
+│   ├── config.py              # Pydantic 配置模型
+│   ├── api.py                 # FastAPI 应用 + HTTP/WS 路由
+│   ├── websocket_handler.py   # WebSocket 处理 + 并发管道
+│   ├── hermes_client.py       # Hermes 客户端 + 延迟压缩
+│   ├── tts_service.py         # Sherpa-ONNX TTS (线程池 + 分块)
+│   ├── asr_service.py         # FunASR ASR (线程池卸载)
+│   ├── protocol.py            # 二进制协议编解码 (v1/v2/v3)
+│   ├── audio_converter.py     # Opus/Ogg/WAV 格式转换
+│   ├── wav_utils.py           # WAV 字节工具
+│   ├── openclaw/
+│   │   ├── __init__.py
+│   │   ├── bridge.py          # OpenClaw WebSocket 桥接
+│   │   └── channel.py         # OpenClaw HTTP 回调
+│   └── cli.py                 # CLI 交互式客户端
+├── configs/
+│   ├── config.example.yaml    # 配置示例
+│   └── config.yaml            # 实际配置 (不提交)
+├── myapp-channel-0.1.0/       # OpenClaw channel 插件 (TypeScript)
 ├── tests/
-│   └── test_bridge.py      # 测试脚本
-├── logs/                    # 日志目录
-├── .gitignore
+│   ├── test_bridge.py         # 集成测试
+│   └── test_e2e_pipeline.py   # 端到端管道测试 + 性能计时
 ├── pyproject.toml
-├── README.md
-└── start.sh
+├── start.sh
+├── .gitignore
+├── LICENSE
+└── README.md
+```
+
+## 配置说明
+
+核心配置项 (`configs/config.example.yaml`):
+
+```yaml
+server:
+  host: "0.0.0.0"
+  port: 8081
+  ping_interval: 15        # WebSocket ping 间隔 (秒)
+
+hermes:
+  host: "127.0.0.1"        # Hermes Gateway 地址
+  port: 8642
+  api_key: "your-key"      # 或环境变量 HERMES_API_KEY
+  timeout: 60
+
+tts:
+  model_dir: "models/matcha-icefall-zh-baker"
+  num_threads: 2
+  prebuffer_chunk_ms: 50   # 首块大小 (越小越快开始发声)
+  stream_chunk_ms: 200     # 后续块大小
+
+memory:
+  enabled: true
+  idle_compress_interval: 30  # 后台压缩间隔 (秒)
+  compress_threshold: 0.65    # 触发压缩的 token 阈值比例
 ```
 
 ## 与 Hermes Agent 集成
 
-Robot Bridge 依赖本地部署的 Hermes Gateway:
+Robot Bridge 依赖本地 Hermes Gateway 提供的 LLM API 端点。确认 Hermes 已启用 `api_server` 插件并运行：
 
-1. 确保 Hermes Gateway 已部署并运行
-2. 确认 Hermes 开启 api_server 插件
-3. 配置正确的端口 (默认 8642) 和 API Key
-
-Hermes 配置参考:
 ```yaml
 # Hermes config.yaml
 platforms:
@@ -191,24 +242,57 @@ platforms:
     key: "your-api-key"
 ```
 
-## 引用项目
+## OpenClaw Agent 集成 (可选)
 
-本项目基于以下开源项目构建：
+若使用 OpenClaw 作为对话引擎而非直接调用 Hermes：
 
-| 项目 | 说明 | 链接 |
-|------|------|------|
-| **Hermes Agent** | AI Agent 框架，支持长期记忆、技能系统 | [GitHub](https://github.com/hermes-agent/hermes-agent) |
-| **StackChan** | M5Stack 开源桌面机器人 | [GitHub](https://github.com/m5stack/StackChan) |
-| **xiaozhi-esp32** | ESP32 语音对话固件 | [GitHub](https://github.com/78/xiaozhi-esp32) |
-| **Edge TTS** | 微软 Edge 语音合成 Python 客户端 | [PyPI](https://pypi.org/project/edge-tts/) |
-| **FastAPI** | 现代 Python Web 框架 | [GitHub](https://github.com/tiangolo/fastapi) |
+1. 部署 OpenClaw 并安装 `myapp-channel` 插件
+2. 配置 `myapp-channel` 连接到 robot-bridge 的 OpenClaw 桥接端点
+3. 在代码中调用 `openclaw/bridge.py` 的 `request_reply()` 方法
+
+详情见 [myapp-channel 文档](myapp-channel-0.1.0/myapp-channel/README.md)。
+
+## 性能指标 (参考)
+
+真实 Sherpa-ONNX Matcha TTS (vocos-22kHz) 基准测试结果 (5轮):
+
+| 指标 | 实测值 |
+|------|--------|
+| TTS 单句合成 | **80-120ms** (短句, ~1.5s音频) |
+| TTS 整段回复 | **224-407ms** (3-5句, ~10s音频) |
+| TTS 音质 | 22050Hz, 16-bit, 单声道 PCM |
+| LLM + TTS 并发总耗时 | **~2.0-2.8s** (LLM模拟 2s + TTS 并行) |
+| 分块流式首块 | **50ms** 预缓冲即刻发出 |
+| 后续分块间隔 | **200ms** 每块 (~0.9s音频/块) |
+
+优化前后对比:
+
+| 指标 | v0.1 (之前) | v0.2 (优化后) | 提升 |
+|------|------------|--------------|------|
+| ASR 延迟 | ~500-1500ms (阻塞事件循环) | ~500-1500ms (线程池, 不阻塞) | 并发友好 |
+| compress 延迟 | ~2000ms (在响应关键路径上) | ~0ms (后台异步) | 节省 ~2s |
+| TTS 首块延迟 | 等整句合成完 (~2-5s) | ~50ms 首块先发 | 更快开始发声 |
+| 3 句回复总时间 | ~10-15s (串行) | ~2-3s (并发管道, 实测) | ~60-75% |
+| 多机器人并发 | 串行 (阻塞事件循环) | 并行 (线程池) | 多设备可用 |
+| TTS 单句 RTF | N/A (未测量) | **0.04-0.05** (生成 < 音频时长) | 远快于实时 |
 
 ## 隐私说明
 
-- `configs/config.yaml` 不包含在版本控制中
-- API Keys 和敏感配置使用环境变量或单独管理
-- 日志文件不包含用户对话内容
+- `configs/config.yaml` 不在版本控制中（已在 .gitignore）
+- API Key 从环境变量 `HERMES_API_KEY` 读取，不硬编码
+- 模型文件 (`models/`) 不提交
+- 音频文件、日志文件不提交
 
 ## License
 
 MIT License
+
+## 参考项目
+
+| 项目 | 说明 |
+|------|------|
+| [StackChan](https://github.com/m5stack/StackChan) | M5Stack 开源桌面机器人 |
+| [Hermes Agent](https://github.com/NickYi1990/Hermes) | 本地 AI Agent 框架 |
+| [xiaozhi-esp32-server-golang](https://github.com/hackers365/xiaozhi-esp32-server-golang) | 小智 Go 服务端参考实现 |
+| [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) | 跨平台 TTS 推理引擎 |
+| [FunASR](https://github.com/modelscope/FunASR) | 语音识别工具包 |

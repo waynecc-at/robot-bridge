@@ -1,7 +1,9 @@
 """HTTP API Server for Robot Bridge"""
+import asyncio
 import base64
 import json
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 from contextlib import asynccontextmanager
 from loguru import logger
@@ -37,10 +39,18 @@ class WebSocketMessage(BaseModel):
 # Lifespan for startup/shutdown
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    import asyncio
     from .websocket_handler import ws_handler
 
     logger.info("Robot Bridge API starting...")
+
+    # Shared thread pool for CPU-bound inference (ASR + TTS)
+    executor = ThreadPoolExecutor(
+        max_workers=3,
+        thread_name_prefix="inference",
+    )
+    asr_service.set_executor(executor)
+    tts_service.set_executor(executor)
+
     await hermes_client.__aenter__()
     await asr_service.start()
     await tts_service.start()
@@ -57,6 +67,7 @@ async def lifespan(app: FastAPI):
 
     cleanup_task.cancel()
     await hermes_client.close()
+    executor.shutdown(wait=True)
     logger.info("Robot Bridge API shutting down...")
 
 

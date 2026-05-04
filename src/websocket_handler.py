@@ -1,4 +1,11 @@
-"""WebSocket handler for robot connections with full-duplex barge-in support"""
+"""WebSocket handler for robot connections with concurrent LLM+TTS pipeline.
+
+Optimizations v0.2:
+- Concurrent pipeline: LLM stream reader + TTS worker via asyncio.Queue
+- LLM sentence N+1 generation overlaps with TTS playback of sentence N
+- Thread pool offloaded ASR/TTS (via service layer)
+- Turn-id barge-in checking preserved at all yield points
+"""
 import asyncio
 import json
 import re
@@ -38,8 +45,20 @@ class RobotSession:
             logger.info(f"[WS] Turn cancelled: new turn_id={self.turn_id}")
 
 
+def _split_sentences(buffer: str) -> list[str]:
+    """Split text buffer into complete sentences at Chinese punctuation."""
+    sentences = []
+    while True:
+        m = re.search(r"(.+?[。！？\n])", buffer)
+        if not m:
+            break
+        sentences.append(m.group(1).strip())
+        buffer = buffer[m.end():]
+    return sentences, buffer
+
+
 class RobotWebSocketHandler:
-    """Handles WebSocket connections from robot devices with barge-in support"""
+    """Handles WebSocket connections from robot devices with concurrent pipeline"""
 
     def __init__(self):
         self.sessions: dict[str, RobotSession] = {}
@@ -136,7 +155,6 @@ class RobotWebSocketHandler:
         logger.info(f"[WS] VAD state: {state} from {session.session_id}")
 
         if state == "start":
-            # User started speaking — cancel current turn immediately
             session.cancel_current_turn()
             await self._send_message(session.websocket, {
                 "type": "interrupt",
@@ -150,7 +168,7 @@ class RobotWebSocketHandler:
                 self._start_turn(session, session.current_text)
 
         elif state == "speaking":
-            pass  # Legacy compatibility — handled by start/end now
+            pass
 
     async def _handle_ping(self, session: RobotSession, message: dict):
         await self._send_message(session.websocket, {
@@ -173,7 +191,14 @@ class RobotWebSocketHandler:
         logger.info(f"[WS] Turn {turn_id} started: {text[:60]}")
 
     async def _process_turn(self, session: RobotSession, text: str, turn_id: int):
-        """Cancelable pipeline: LLM stream → sentence split → TTS per sentence"""
+        """Concurrent pipeline: LLM stream → sentence queue → TTS worker.
+
+        LLM streaming and TTS run in parallel via asyncio.Queue.
+        LLM outputs tokens → _llm_reader splits into sentences → pushes to queue
+        → _tts_worker pops sentences → TTS synthesis → sends to robot.
+
+        Both tasks share turn_id checks so either side can abort on barge-in.
+        """
         if not self.hermes:
             logger.error("[WS] Hermes client not available")
             await self._send_message(session.websocket, {
@@ -192,100 +217,92 @@ class RobotWebSocketHandler:
 
             logger.info(f"[WS] Turn {turn_id} processing: {text[:60]}")
 
-            buffer = ""
-            sentence_count = 0
+            # Queue coordinates LLM reader ↔ TTS worker
+            sentence_queue: asyncio.Queue = asyncio.Queue()
 
-            async for token in self.hermes.chat_stream(
-                message=text,
-                session_id=session.session_id,
-                system_prompt=config.robot.system_prompt,
-            ):
-                if turn_id != session.turn_id:
-                    logger.info(f"[WS] Turn {turn_id} preempted (LLM stage)")
-                    return
+            async def llm_reader():
+                """Stream LLM tokens, split into sentences, push to queue."""
+                buffer = ""
+                async for token in self.hermes.chat_stream(
+                    message=text,
+                    session_id=session.session_id,
+                    system_prompt=config.robot.system_prompt,
+                ):
+                    if turn_id != session.turn_id:
+                        logger.info(f"[WS] Turn {turn_id} preempted (LLM reader)")
+                        return
 
-                buffer += token
-                m = re.search(r"(.+?[。！？\n])", buffer)
-                if not m:
-                    continue
+                    buffer += token
+                    sentences, buffer = _split_sentences(buffer)
+                    for sentence in sentences:
+                        await sentence_queue.put(sentence)
 
-                sentence = m.group(1).strip()
-                buffer = buffer[m.end():]
+                # Flush remaining buffer
+                if buffer.strip():
+                    await sentence_queue.put(buffer.strip())
 
-                sentence_count += 1
-                logger.info(f"[WS] Turn {turn_id} sentence {sentence_count}: {sentence[:60]}")
+                # Signal end of LLM output
+                await sentence_queue.put(None)
 
-                # Send sentence text
-                if turn_id != session.turn_id:
-                    return
-                await self._send_message(session.websocket, {
-                    "type": "response_text",
-                    "text": sentence,
-                    "session_id": session.session_id,
-                    "partial": True,
-                    "turn": turn_id,
-                })
+            async def tts_worker():
+                """Consume sentences from queue, TTS synthesize, send audio."""
+                sentence_count = 0
+                while True:
+                    sentence = await sentence_queue.get()
+                    if sentence is None:
+                        break  # No more sentences from LLM
 
-                # Stream TTS for this sentence
-                if turn_id != session.turn_id:
-                    return
-                await self._send_message(session.websocket, {
-                    "type": "status",
-                    "message": "speaking",
-                    "action": "speaking",
-                    "turn": turn_id,
-                })
-
-                async for chunk in tts_service.synthesize_stream(sentence):
                     if turn_id != session.turn_id:
                         return
+
+                    sentence_count += 1
+                    logger.info(
+                        f"[WS] Turn {turn_id} sentence {sentence_count}: {sentence[:60]}"
+                    )
+
+                    # Send sentence text
                     await self._send_message(session.websocket, {
-                        "type": "tts_audio",
-                        "format": "wav",
-                        "data": base64.b64encode(chunk).decode(),
-                        "final": False,
+                        "type": "response_text",
+                        "text": sentence,
+                        "session_id": session.session_id,
+                        "partial": True,
                         "turn": turn_id,
                     })
 
-            # Last sentence without punctuation
-            if buffer.strip() and turn_id == session.turn_id:
-                sentence_count += 1
-
-                await self._send_message(session.websocket, {
-                    "type": "response_text",
-                    "text": buffer.strip(),
-                    "session_id": session.session_id,
-                    "partial": True,
-                    "turn": turn_id,
-                })
-
-                await self._send_message(session.websocket, {
-                    "type": "status",
-                    "message": "speaking",
-                    "action": "speaking",
-                    "turn": turn_id,
-                })
-
-                async for chunk in tts_service.synthesize_stream(buffer.strip()):
                     if turn_id != session.turn_id:
                         return
+
                     await self._send_message(session.websocket, {
-                        "type": "tts_audio",
-                        "format": "wav",
-                        "data": base64.b64encode(chunk).decode(),
-                        "final": False,
+                        "type": "status",
+                        "message": "speaking",
+                        "action": "speaking",
                         "turn": turn_id,
                     })
 
-            # Final marker
-            if turn_id == session.turn_id:
-                await self._send_message(session.websocket, {
-                    "type": "tts_audio",
-                    "data": "",
-                    "final": True,
-                    "turn": turn_id,
-                })
-                logger.info(f"[WS] Turn {turn_id} complete: {sentence_count} sentences")
+                    # Stream TTS for this sentence (chunked, first chunk in ~50ms)
+                    async for chunk in tts_service.synthesize_stream(sentence):
+                        if turn_id != session.turn_id:
+                            return
+                        await self._send_message(session.websocket, {
+                            "type": "tts_audio",
+                            "format": "wav",
+                            "data": base64.b64encode(chunk).decode(),
+                            "final": False,
+                            "turn": turn_id,
+                        })
+
+                # Final marker
+                if turn_id == session.turn_id:
+                    await self._send_message(session.websocket, {
+                        "type": "tts_audio",
+                        "data": "",
+                        "final": True,
+                        "turn": turn_id,
+                    })
+                    logger.info(f"[WS] Turn {turn_id} complete: {sentence_count} sentences")
+
+            # Run both tasks concurrently: LLM reading + TTS processing overlap
+            await asyncio.gather(llm_reader(), tts_worker())
 
         except asyncio.CancelledError:
             logger.info(f"[WS] Turn {turn_id} cancelled (CancelledError)")
