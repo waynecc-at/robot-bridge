@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 from contextlib import asynccontextmanager
 from loguru import logger
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -54,6 +55,10 @@ async def lifespan(app: FastAPI):
     await hermes_client.__aenter__()
     await asr_service.start()
     await tts_service.start()
+
+    # Restore persistent sessions from disk
+    Path(config.memory.persist_path).mkdir(parents=True, exist_ok=True)
+    hermes_client.restore_sessions()
 
     # Background task to clean up stale WebSocket sessions every 5 minutes
     async def cleanup_loop():

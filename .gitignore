@@ -43,6 +43,9 @@ models/
 *.onnx
 *.tar.bz2
 
+# Session persistence (conversation history, not for VCS)
+data/
+
 # Temporary
 tmp/
 temp/

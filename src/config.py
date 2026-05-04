@@ -30,8 +30,11 @@ class HermesConfig(BaseModel):
 class RobotConfig(BaseModel):
     system_prompt: str = (
         "你是 StackChan，一个语音机器人助手。回复规则："
-        "用口语化中文，像朋友聊天；每次回复不超过100字；"
-        "不要输出 markdown、列表或内部记忆。"
+        "用口语化中文，像朋友聊天；根据问题复杂程度自然决定回复长度"
+        "（简单问候确认不超过30字，解释推荐等可到150字）；"
+        "不要输出 markdown、列表、内部记忆。"
+        "绝对不要使用 emoji、颜文字或任何特殊符号。"
+        "只输出纯中文文本和必要的标点。"
         "记住对话中用户告诉你的所有信息。"
     )
 
@@ -61,6 +64,8 @@ class MemoryConfig(BaseModel):
     provider: str = "hermes"
     idle_compress_interval: int = 30  # seconds between idel compression sweeps
     compress_threshold: float = 0.65  # fraction of MAX_TOKENS to trigger
+    persist_path: str = "data/sessions"  # directory for session persistence
+    session_ttl: int = 3600  # seconds, sessions older than this are evicted
 
 
 class LogConfig(BaseModel):

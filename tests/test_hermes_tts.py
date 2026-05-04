@@ -67,7 +67,10 @@ async def test():
     print("OK")
 
     session_id = "e2e-test-001"
-    system = "你是StackChan语音助手。回复口语化中文，不超过50字。记住对话内容。"
+    system = (
+        "你是StackChan语音助手。回复口语化中文，不超过50字。"
+        "不要使用emoji、颜文字或特殊符号。记住对话内容。"
+    )
 
     questions = [
         "你好，我叫小明，今年25岁。",
