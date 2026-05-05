@@ -12,14 +12,16 @@ import re
 import time
 import base64
 from typing import Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from loguru import logger
 
 from .asr_service import asr_service
 from .config import config
 from .hermes_client import HermesClient
+from .profile_store import profile_store
 from .text_utils import sanitize_for_tts
 from .tts_service import tts_service
+from .vision_service import vision_service
 
 
 @dataclass
@@ -37,6 +39,10 @@ class RobotSession:
     # Barge-in turn management
     turn_id: int = 0
     pending_task: Optional[asyncio.Task] = None
+
+    # Vision / person tracking
+    current_person: Optional[str] = None    # name of recognized person
+    person_profiles: dict[str, dict] = field(default_factory=dict)  # multi-user: name → {name, relationship, preferences}
 
     def cancel_current_turn(self):
         """Cancel the active turn so a new one can start"""
@@ -97,6 +103,8 @@ class RobotWebSocketHandler:
                 await self._handle_audio_message(session, message)
             elif msg_type == "vad":
                 await self._handle_vad_message(session, message)
+            elif msg_type == "vision_frame":
+                await self._handle_vision_frame(session, message)
             elif msg_type == "ping":
                 await self._handle_ping(session, message)
             else:
@@ -171,6 +179,58 @@ class RobotWebSocketHandler:
         elif state == "speaking":
             pass
 
+    async def _handle_vision_frame(self, session: RobotSession, message: dict):
+        """Process a JPEG frame from ESP32 camera (base64-encoded)."""
+        if not vision_service.enabled:
+            return
+
+        jpeg_b64 = message.get("data", "")
+        if not jpeg_b64:
+            return
+
+        jpeg_bytes = base64.b64decode(jpeg_b64)
+        results = await vision_service.process_frame(jpeg_bytes)
+
+        # Multi-user: merge all recognized persons into session
+        if results:
+            seen_names = set()
+            for det in results:
+                name = det.get("name", "unknown")
+                if name == "unknown":
+                    continue
+                seen_names.add(name)
+                if name in session.person_profiles:
+                    continue  # already tracked
+                profile = profile_store.get_profile(name)
+                session.person_profiles[name] = {
+                    "name": name,
+                    "relationship": profile.relationship if profile else "",
+                    "preferences": profile.preferences if profile else "",
+                }
+                await self._send_message(session.websocket, {
+                    "type": "person_detected",
+                    "name": name,
+                    "relationship": session.person_profiles[name].get("relationship", ""),
+                })
+                logger.info(f"[WS] Person '{name}' entered frame")
+
+            # Remove persons no longer in frame
+            departed = [
+                n for n in session.person_profiles
+                if n not in seen_names
+            ]
+            for name in departed:
+                logger.info(f"[WS] Person '{name}' left frame")
+                del session.person_profiles[name]
+
+            session.current_person = next(iter(session.person_profiles), None)
+        else:
+            # No faces at all
+            if session.person_profiles:
+                session.person_profiles.clear()
+                session.current_person = None
+                logger.info("[WS] All persons left frame")
+
     async def _handle_ping(self, session: RobotSession, message: dict):
         await self._send_message(session.websocket, {
             "type": "pong",
@@ -219,6 +279,26 @@ class RobotWebSocketHandler:
         except asyncio.CancelledError:
             pass
 
+    def _build_system_prompt(self, session: RobotSession) -> str:
+        """Build system prompt with multi-user profile injection."""
+        base = config.robot.system_prompt
+        if not session.person_profiles:
+            return base
+
+        lines = [base, "\n当前在场用户信息："]
+        for name, p in session.person_profiles.items():
+            rel = p.get("relationship", "")
+            pref = p.get("preferences", "")
+            info = f"- {name}"
+            if rel:
+                info += f"（{rel}）"
+            if pref:
+                info += f"，偏好：{pref}"
+            lines.append(info)
+
+        lines.append("根据当前用户身份调整回应。")
+        return "\n".join(lines)
+
     async def _process_turn(self, session: RobotSession, text: str, turn_id: int):
         """Concurrent pipeline: LLM stream → sentence queue → TTS worker.
 
@@ -262,7 +342,7 @@ class RobotWebSocketHandler:
                     async for token in self.hermes.chat_stream(
                         message=text,
                         session_id=session.session_id,
-                        system_prompt=config.robot.system_prompt,
+                        system_prompt=self._build_system_prompt(session),
                     ):
                         if turn_id != session.turn_id:
                             logger.info(f"[WS] Turn {turn_id} preempted (LLM reader)")

@@ -68,6 +68,21 @@ class MemoryConfig(BaseModel):
     session_ttl: int = 3600  # seconds, sessions older than this are evicted
 
 
+class VisionConfig(BaseModel):
+    enabled: bool = False
+    # Face detection
+    min_face_size: int = 80         # minimum face px for recognition
+    detection_interval: float = 1.0  # seconds between frame processing
+    # Face recognition
+    recognition_threshold: int = 80  # LBPH confidence threshold (lower = stricter)
+    # Profile store
+    profile_path: str = "data/profiles"
+    # Camera source ('esp32' or 'local')
+    source: str = "esp32"
+    # Local camera (for testing without StackChan)
+    local_cam_id: int = 0
+
+
 class LogConfig(BaseModel):
     level: str = "INFO"
     file: str = "logs/bridge.log"
@@ -81,6 +96,7 @@ class Config(BaseModel):
     robot: RobotConfig = RobotConfig()
     tts: TTSConfig = TTSConfig()
     memory: MemoryConfig = MemoryConfig()
+    vision: VisionConfig = VisionConfig()
     log: LogConfig = LogConfig()
 
 

@@ -17,6 +17,7 @@ from .asr_service import asr_service
 from .config import config
 from .hermes_client import hermes_client
 from .tts_service import tts_service
+from .vision_service import vision_service
 
 
 # Pydantic models
@@ -59,6 +60,11 @@ async def lifespan(app: FastAPI):
     # Restore persistent sessions from disk
     Path(config.memory.persist_path).mkdir(parents=True, exist_ok=True)
     hermes_client.restore_sessions()
+
+    # Start vision service (no-op if disabled in config)
+    if config.vision.enabled:
+        vision_service.enabled = True
+        logger.info("[API] Vision service enabled")
 
     # Background task to clean up stale WebSocket sessions every 5 minutes
     async def cleanup_loop():
@@ -240,6 +246,50 @@ async def list_voices(language: Optional[str] = None):
         "voices": formatted,
         "count": len(formatted)
     }
+
+
+# ============= Profile / Vision Endpoints =============
+
+class ProfileRegisterRequest(BaseModel):
+    name: str
+    relationship: str = ""
+    preferences: str = ""
+
+@app.post("/api/profile/register")
+async def register_profile(request: ProfileRegisterRequest):
+    """Register a person profile (face training not included)."""
+    from .profile_store import profile_store
+
+    profile_store.save_profile(
+        name=request.name,
+        relationship=request.relationship,
+        preferences=request.preferences,
+    )
+    return {"status": "ok", "name": request.name}
+
+
+@app.get("/api/profiles")
+async def list_profiles():
+    """List all registered person profiles."""
+    from .profile_store import profile_store
+    profiles = []
+    for p in profile_store.get_all_profiles():
+        profiles.append({
+            "name": p.name,
+            "relationship": p.relationship,
+            "preferences": p.preferences,
+            "sample_count": p.sample_count,
+            "last_seen": p.last_seen,
+        })
+    return {"profiles": profiles}
+
+
+@app.delete("/api/profile/{name}")
+async def delete_profile(name: str):
+    """Delete a person profile."""
+    from .profile_store import profile_store
+    ok = profile_store.remove_person(name)
+    return {"status": "ok" if ok else "not_found"}
 
 
 # ============= WebSocket Endpoint =============

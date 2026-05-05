@@ -20,6 +20,7 @@ StackChan 桌面机器人桥接服务 — 连接 M5Stack / ESP32 设备与本地
 - **Token 用量追踪** — 从 API 响应实时获取真实 token 计数
 - **并发管道** — LLM 流式 + TTS 合成异步重叠，首块 50ms 预缓冲
 - **Barge-in 抢占中断** — 随时打断，带自然收尾淡出
+- **视觉智能 (Phase 2)** — 人脸检测识别、运动检测、人物跟随、动态人物画像注入 LLM
 - **CLI 客户端** — 交互式对话、TTS 试听
 
 ## 系统架构
@@ -72,6 +73,69 @@ StackChan 桌面机器人桥接服务 — 连接 M5Stack / ESP32 设备与本地
 | TTS RTF | **0.04-0.06** | **0.04-0.06** |
 
 Server Session 模式每次只发 2 条消息，无论会话多长。Stateless 模式需要发送完整历史，消息量线性增长。
+
+## 视觉智能 (Phase 2)
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ StackChan (ESP32-S3) — 边缘处理                              │
+│                                                              │
+│  GC0308 摄像头 (QVGA 320x240)                                 │
+│  ├─ 运动检测 (ESP motion_detect, ~15-65 FPS)                 │
+│  ├─ 人脸检测 (ESP-WHO, ~3-5 FPS)                             │
+│  ├─ JPEG编码 + base64 → WebSocket 上传                       │
+│  └─ 舵机PID跟随 (人脸偏移 → 伺服角度)                         │
+└──────────────────────┬──────────────────────────────────────┘
+                       │ WebSocket: vision_frame (base64 JPEG)
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ robot-bridge (Python)                                        │
+│                                                               │
+│  src/                                                        │
+│  ├─ vision_service.py    解码 → 人脸检测 → 识别 → 追踪        │
+│  ├─ profile_store.py     人物画像 + LBPH 模型持久化            │
+│  └─ websocket_handler.py vision_frame 处理 + 动态prompt注入    │
+│                                                               │
+│  收到帧 → OpenCV解码 → Haar级联检测 → LBPH识别                 │
+│  → 匹配画像 → 更新session.person_profile                       │
+│  → 下次LLM请求自动注入: "称呼用户为「小明」。他是你的主人。"      │
+└──────────────────────┬──────────────────────────────────────┘
+                       │ LLM context with person profile
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Hermes Agent                                                │
+│  输入: system_prompt + "称呼用户为「小明」, 他是你的主人"      │
+│  输出: "小明你好, 今天想聊点什么？"                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 人物识别流程
+
+1. **ESP32**: 每秒拍一帧 JPEG → base64 → `{"type":"vision_frame","data":"..."}`
+2. **vision_service**: 接收帧 → `asyncio` 线程池解码 → `profile_store.detect_and_recognize()`
+3. **profile_store**: Haar级联检测人脸 → LBPH识别 → 匹配已知画像
+4. **websocket_handler**: 识别到人物 → 更新 `session.person_profile` → 注入LLM system_prompt
+5. **Hermes**: LLM 回复包含人物信息（称呼名字、记住偏好）
+
+### 人物画像注册
+
+通过 API 注册新人物:
+
+```bash
+curl -X POST http://localhost:8081/api/profile/register \
+  -H "Content-Type: application/json" \
+  -d '{"name":"小明","relationship":"主人","preferences":"喜欢户外运动"}'
+```
+
+注册时从摄像头捕获 5-10 帧人脸，自动训练 LBPH 识别器。
+
+### 依赖
+
+```bash
+pip install opencv-python numpy
+```
+
+OpenCV 为可选依赖。不安装时视觉功能自动禁用，不影响语音对话。
 
 ## 快速开始
 
@@ -191,11 +255,13 @@ robot-bridge/
 │   ├── main.py                 # 入口 + uvicorn 启动
 │   ├── config.py               # Pydantic 配置
 │   ├── api.py                  # FastAPI + WebSocket 路由
-│   ├── websocket_handler.py    # 并发管道 + 超时保护 + 心跳
+│   ├── websocket_handler.py    # 并发管道 + 超时保护 + 心跳 + 视觉
 │   ├── hermes_client.py        # Hermes 客户端 + Server Session
 │   ├── text_utils.py           # 文本净化
 │   ├── tts_service.py          # Sherpa-ONNX TTS
 │   ├── asr_service.py          # FunASR ASR
+│   ├── vision_service.py       # 人脸检测/识别/追踪 (OpenCV)
+│   ├── profile_store.py        # 人物画像 + LBPH 识别器持久化
 │   ├── protocol.py             # 二进制协议编解码
 │   ├── audio_converter.py      # Opus/Ogg/WAV 转换
 │   ├── cli.py                  # CLI 客户端
