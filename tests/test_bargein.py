@@ -6,6 +6,7 @@ Run: python -m tests.test_bargein
 import asyncio
 import base64
 import json
+import time
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -43,6 +44,7 @@ async def verify(cond: bool, label: str):
 
 async def test_audio_buffering():
     """Verify audio chunks are buffered during VAD and NOT individually ASR'd."""
+    t0 = time.perf_counter()
     print("\n" + "=" * 65)
     print("  Round 1: VAD Audio Buffering & Batch Transcription")
     print("=" * 65)
@@ -64,8 +66,6 @@ async def test_audio_buffering():
     )
 
     # ── 1b. Audio during VAD → buffered, no status/ASR triggered ──
-    # Audio chunks arriving during is_listening=True must be buffered
-    # and NOT trigger individual ASR (no "listening" status sent)
     chunk1 = b"\x00\x01" * 8000
     chunk2 = b"\x00\x02" * 8000
     b64_1 = base64.b64encode(chunk1).decode()
@@ -75,8 +75,6 @@ async def test_audio_buffering():
     await handler._handle_audio_message(session, {"type": "audio", "data": b64_2})
 
     ok &= await verify(len(session.audio_buffer) >= 1, "audio chunks accumulated in buffer")
-    # No "status" messages sent for individual chunks (those come from the
-    # non-VAD audio path). Only the "interrupt" from VAD start was sent.
     ok &= await verify(
         len(ws.get_messages("status")) == 0,
         "no status messages sent for individual audio chunks during VAD",
@@ -90,14 +88,16 @@ async def test_audio_buffering():
         f"buffer holds all chunks ({total_buffered} == {expected_size})",
     )
 
-    print(f"\n  Round 1: {'ALL PASS' if ok else 'SOME FAILED'}")
-    return ok
+    elapsed = time.perf_counter() - t0
+    print(f"\n  Round 1: {'ALL PASS' if ok else 'SOME FAILED'}  [{elapsed*1000:.0f}ms]")
+    return ok, elapsed
 
 
 # ── Round 2: Turn cancellation during LLM/TTS ────────────────
 
 async def test_turn_cancellation():
     """Verify VAD start cancels an in-flight LLM/TTS turn."""
+    t0 = time.perf_counter()
     print("\n" + "=" * 65)
     print("  Round 2: LLM/TTS Barge-in — Turn Cancellation")
     print("=" * 65)
@@ -107,10 +107,8 @@ async def test_turn_cancellation():
     handler = RobotWebSocketHandler()
 
     # Mock Hermes so _process_turn doesn't fast-fail
-    # Stream a few tokens with real async delays so the pipeline
-    # stays alive long enough for us to observe its state.
     async def fake_stream(*args, **kwargs):
-        await asyncio.sleep(0.15)  # simulate LLM TTFT delay
+        await asyncio.sleep(0.15)
         yield "你好"
         await asyncio.sleep(0.05)
         yield "，"
@@ -126,7 +124,7 @@ async def test_turn_cancellation():
     original_tts = tts_mod.tts_service.synthesize_stream
 
     async def fake_tts_stream(*args, **kwargs):
-        yield b"\x00\x00\x00\x00" * 100  # 400 bytes fake WAV
+        yield b"\x00\x00\x00\x00" * 100
     tts_mod.tts_service.synthesize_stream = fake_tts_stream
 
     ok = True
@@ -135,7 +133,7 @@ async def test_turn_cancellation():
         # ── 2a. Start a turn ──
         turn_id_before = session.turn_id
         handler._start_turn(session, "测试消息")
-        await asyncio.sleep(0.1)  # let the pipeline spin up
+        await asyncio.sleep(0.1)
 
         ok &= await verify(
             session.turn_id > turn_id_before,
@@ -162,7 +160,7 @@ async def test_turn_cancellation():
             "is_listening=True after VAD start",
         )
         ok &= await verify(
-            session.turn_id == 2,  # 1 start + 1 cancel
+            session.turn_id == 2,
             "turn_id correctly tracking starts and cancels",
         )
 
@@ -176,14 +174,16 @@ async def test_turn_cancellation():
     finally:
         tts_mod.tts_service.synthesize_stream = original_tts
 
-    print(f"\n  Round 2: {'ALL PASS' if ok else 'SOME FAILED'}")
-    return ok
+    elapsed = time.perf_counter() - t0
+    print(f"\n  Round 2: {'ALL PASS' if ok else 'SOME FAILED'}  [{elapsed*1000:.0f}ms]")
+    return ok, elapsed
 
 
 # ── Round 3: Rapid barge-in / turn-id safety ─────────────────
 
 async def test_rapid_bargein():
     """Verify rapid VAD sequences don't leak tasks or corrupt turn-id."""
+    t0 = time.perf_counter()
     print("\n" + "=" * 65)
     print("  Round 3: Rapid Barge-in Sequences & Turn-id Safety")
     print("=" * 65)
@@ -191,9 +191,9 @@ async def test_rapid_bargein():
     ws = MockWebSocket()
     session = RobotSession(device_id="test", session_id="r3", websocket=ws)
     handler = RobotWebSocketHandler()
-    handler.hermes = None  # will fail fast — we only test turn-id tracking here
+    handler.hermes = None
 
-    # Mock ASR to avoid loading real model (funasr not installed in test env)
+    # Mock ASR to avoid loading real model
     async def fake_transcribe(audio: bytes) -> str:
         return "测试语音转文字结果"
 
@@ -201,9 +201,6 @@ async def test_rapid_bargein():
     mock_asr.start()
 
     ok = True
-
-    # Record initial task count
-    tasks_before = len(asyncio.all_tasks())
 
     # ── 3a. 5 rapid barges ──
     for i in range(5):
@@ -213,7 +210,7 @@ async def test_rapid_bargein():
         await asyncio.sleep(0.01)
 
     ok &= await verify(
-        session.turn_id == 10,  # 5 starts + 5 cancels = 10
+        session.turn_id == 10,
         f"turn_id=10 after 5 rapid cycles (got {session.turn_id})",
     )
     ok &= await verify(
@@ -228,7 +225,7 @@ async def test_rapid_bargein():
         f"no leaked turn tasks ({len(turn_tasks)} found)",
     )
 
-    # ── 3c. VAD end with buffer (ASR not loaded) fails gracefully ──
+    # ── 3c. VAD end with buffer ──
     await handler._handle_vad_message(session, {"type": "vad", "state": "start"})
     session.audio_buffer.append(b"\x00\x01" * 8000)
     session.audio_buffer.append(b"\x00\x02" * 8000)
@@ -239,16 +236,11 @@ async def test_rapid_bargein():
         not session.is_listening,
         "is_listening=False after VAD end",
     )
-    # ASR call failed but didn't crash — buffer may or may not be cleared
-    # depending on exception timing
-    ok &= await verify(
-        not session.is_listening,
-        "no crash after VAD end with unloaded ASR",
-    )
 
     mock_asr.stop()
-    print(f"\n  Round 3: {'ALL PASS' if ok else 'SOME FAILED'}")
-    return ok
+    elapsed = time.perf_counter() - t0
+    print(f"\n  Round 3: {'ALL PASS' if ok else 'SOME FAILED'}  [{elapsed*1000:.0f}ms]")
+    return ok, elapsed
 
 
 # ── Report ────────────────────────────────────────────────────
@@ -259,15 +251,34 @@ async def main():
     print("=" * 65)
 
     results = []
-    results.append(await test_audio_buffering())
+    timings = []
+
+    ok, dur = await test_audio_buffering()
+    results.append(ok)
+    timings.append(dur)
+
     await asyncio.sleep(0.1)
-    results.append(await test_turn_cancellation())
+
+    ok, dur = await test_turn_cancellation()
+    results.append(ok)
+    timings.append(dur)
+
     await asyncio.sleep(0.1)
-    results.append(await test_rapid_bargein())
+
+    ok, dur = await test_rapid_bargein()
+    results.append(ok)
+    timings.append(dur)
 
     passed = sum(results)
     total = len(results)
+    total_time = sum(timings) * 1000
+
     print(f"\n{'=' * 65}")
+    print(f"  用时明细:")
+    for i, (ok, dur) in enumerate(zip(results, timings), 1):
+        status = "PASS" if ok else "FAIL"
+        print(f"    Round {i}: {dur*1000:.0f}ms  [{status}]")
+    print(f"    总计:   {total_time:.0f}ms")
     print(f"  Result: {passed}/{total} rounds passed")
     print(f"{'=' * 65}")
     return all(results)

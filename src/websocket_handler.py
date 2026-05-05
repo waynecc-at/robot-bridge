@@ -18,6 +18,7 @@ from loguru import logger
 from .asr_service import asr_service
 from .config import config
 from .hermes_client import HermesClient
+from .metrics import metrics
 from .profile_store import profile_store
 from .text_utils import sanitize_for_tts
 from .tts_service import tts_service
@@ -52,6 +53,7 @@ class RobotSession:
         self.turn_id += 1
         if self.pending_task and not self.pending_task.done():
             self.pending_task.cancel()
+            metrics.turns_cancelled += 1
             logger.info(f"[WS] Turn cancelled: new turn_id={self.turn_id}")
 
 
@@ -98,6 +100,7 @@ class RobotWebSocketHandler:
                 message = json.loads(raw_message)
 
             msg_type = message.get("type", "unknown")
+            metrics.record_ws_message(msg_type)
             logger.debug(f"[WS] Message type={msg_type} from {session.session_id}")
 
             if msg_type == "text":
@@ -181,6 +184,11 @@ class RobotWebSocketHandler:
                 "turn": session.turn_id,
             })
             logger.info(f"[WS] Barge-in: interrupt sent, new turn_id={session.turn_id}")
+
+            # Fire-and-forget LLM pre-warm while user is still speaking
+            # (reduces TTFT when ASR completes and LLM turn starts)
+            if self.hermes:
+                asyncio.create_task(self.hermes.ensure_warm())
 
         elif state == "end":
             session.is_listening = False
@@ -269,6 +277,7 @@ class RobotWebSocketHandler:
             name=f"turn-{turn_id}-{session.session_id}",
         )
         session.pending_task = task
+        metrics.turns_total += 1
         logger.info(f"[WS] Turn {turn_id} started: {text[:60]}")
 
     async def _thinking_heartbeat(self, session: RobotSession, turn_id: int):
@@ -449,6 +458,7 @@ class RobotWebSocketHandler:
                     })
 
                     # TTS with error resilience — don't crash pipeline
+                    metrics.tts_requests += 1
                     try:
                         async for chunk in tts_service.synthesize_stream(sentence):
                             if turn_id != session.turn_id:
@@ -457,14 +467,17 @@ class RobotWebSocketHandler:
                                     "final": True, "turn": session.turn_id,
                                 })
                                 return
+                            # Header text frame, then audio data as binary frame
                             await self._send_message(session.websocket, {
                                 "type": "tts_audio",
                                 "format": "wav",
-                                "data": base64.b64encode(chunk).decode(),
                                 "final": False,
                                 "turn": turn_id,
                             })
+                            metrics.tts_audio_bytes += len(chunk)
+                            await session.websocket.send_bytes(chunk)
                     except Exception as e:
+                        metrics.tts_errors += 1
                         logger.warning(f"[WS] TTS failed for sentence, skipping: {e}")
                         continue
 

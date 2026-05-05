@@ -2,20 +2,21 @@
 import asyncio
 import base64
 import json
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 from contextlib import asynccontextmanager
 from loguru import logger
-from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, Response
 from pydantic import BaseModel
 
 from .asr_service import asr_service
 from .config import config
 from .hermes_client import hermes_client
+from .metrics import metrics
 from .tts_service import tts_service
 from .vision_service import vision_service
 
@@ -56,10 +57,6 @@ async def lifespan(app: FastAPI):
     await hermes_client.__aenter__()
     await asr_service.start()
     await tts_service.start()
-
-    # Restore persistent sessions from disk
-    Path(config.memory.persist_path).mkdir(parents=True, exist_ok=True)
-    hermes_client.restore_sessions()
 
     # Start vision service (no-op if disabled in config)
     if config.vision.enabled:
@@ -121,6 +118,21 @@ async def root():
             "voices": "/api/voices",
         }
     }
+
+
+@app.get("/api/metrics")
+async def api_metrics():
+    """Pipeline metrics in JSON format."""
+    return metrics.json()
+
+
+@app.get("/api/metrics/prometheus")
+async def api_metrics_prometheus():
+    """Pipeline metrics in Prometheus text format."""
+    return Response(
+        content=metrics.prometheus(),
+        media_type="text/plain; charset=utf-8",
+    )
 
 
 # ============= Chat Endpoints =============
@@ -294,38 +306,58 @@ async def delete_profile(name: str):
 
 # ============= WebSocket Endpoint =============
 
+WS_IDLE_TIMEOUT = 300  # seconds without activity → goodbye + close
+
 @app.websocket("/ws/robot")
 async def websocket_endpoint(websocket: WebSocket):
     """
-    WebSocket endpoint for ESP32 connections
-    
+    WebSocket endpoint for ESP32 connections.
+
+    Continuous conversation mode: once connected, no wake word needed.
+    Idle for 5 minutes → sends goodbye message and closes.
+    ESP32 should return to low-power wake-word listening on close.
+
     Protocol:
     - Send: {"type": "text", "text": "Hello"}
     - Receive: {"type": "response_text", "text": "Hi there!"}
     - Receive: {"type": "tts_audio", "data": "base64...", "final": false}
     """
     from .websocket_handler import ws_handler
-    
+
     await websocket.accept()
     logger.info("[WS] WebSocket client connected")
-    
+
     await ws_handler.set_hermes_client(hermes_client)
+
+    session_id = str(uuid.uuid4())[:8]
+    session = RobotSession(websocket=websocket, session_id=session_id)
+    ws_handler.sessions[session_id] = session
 
     try:
         while True:
-            data = await websocket.receive_text()
+            idle = time.time() - session.last_activity
+            if idle > WS_IDLE_TIMEOUT:
+                logger.info(f"[WS] Session {session_id} idle timeout ({idle:.0f}s)")
+                await ws_handler._send_message(websocket, {
+                    "type": "goodbye", "reason": "idle_timeout",
+                })
+                await websocket.close(1000, "idle_timeout")
+                break
+
+            data = await asyncio.wait_for(websocket.receive_text(), timeout=5)
+            session.last_activity = time.time()
             logger.debug(f"[WS] Received: {data[:100]}...")
+            await ws_handler._handle_message(session, data)
 
-            session_id = "http_client"
-            await ws_handler._handle_message(
-                RobotSession(websocket, session_id),
-                data
-            )
-
+    except asyncio.TimeoutError:
+        # Normal: looped around to check idle timeout
+        pass
     except WebSocketDisconnect:
         logger.info("[WS] WebSocket client disconnected")
     except Exception as e:
         logger.error(f"[WS] Error: {e}")
+    finally:
+        ws_handler.sessions.pop(session_id, None)
 
 
 class RobotSession:

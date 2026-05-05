@@ -62,10 +62,8 @@ class TTSConfig(BaseModel):
 class MemoryConfig(BaseModel):
     enabled: bool = True
     provider: str = "hermes"
-    idle_compress_interval: int = 30  # seconds between idel compression sweeps
+    idle_compress_interval: int = 30  # seconds between idle compression sweeps
     compress_threshold: float = 0.65  # fraction of MAX_TOKENS to trigger
-    persist_path: str = "data/sessions"  # directory for session persistence
-    session_ttl: int = 3600  # seconds, sessions older than this are evicted
 
 
 class VisionConfig(BaseModel):

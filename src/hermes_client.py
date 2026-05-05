@@ -17,13 +17,13 @@ import asyncio
 import json
 import time
 import uuid
-from pathlib import Path
 from typing import AsyncGenerator, Optional
 from dataclasses import dataclass, field
 from loguru import logger
 import httpx
 
 from .config import config
+from .metrics import metrics
 
 
 @dataclass
@@ -92,29 +92,6 @@ class SessionStore:
             self._pending_compression = True
             logger.info(f"[Hermes] Session {self.session_id[:8]} marked for compression "
                         f"(tokens={self._total_tokens})")
-
-    def to_dict(self) -> dict:
-        """Serialize session for disk persistence."""
-        return {
-            "session_id": self.session_id,
-            "system_prompt": self.system_prompt,
-            "messages": self.messages,
-            "summary": self.summary,
-            "_total_tokens": self._total_tokens,
-            "_compress_count": self._compress_count,
-            "saved_at": time.time(),
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict) -> "SessionStore":
-        """Restore a session from serialized dict."""
-        store = cls(data.get("system_prompt", ""))
-        store.session_id = data["session_id"]
-        store.messages = data.get("messages", [])
-        store.summary = data.get("summary", "")
-        store._total_tokens = data.get("_total_tokens", 0)
-        store._compress_count = data.get("_compress_count", 0)
-        return store
 
     def build_messages(self) -> list[dict]:
         """Build the full messages array to send to Hermes."""
@@ -197,6 +174,12 @@ class HermesClient:
         self._last_usage: dict = {}
         self._force_stateless: bool = False  # test flag: use full history even with api_key
 
+        # TTFT tracking & adaptive timeout
+        self._ttft_window: list[float] = []
+        self._last_request_time: float = 0
+        self._model_warm_at: float = 0
+        self._warmup_lock = asyncio.Lock()
+
     async def __aenter__(self):
         if self._client is None:
             headers = {"Content-Type": "application/json"}
@@ -233,8 +216,7 @@ class HermesClient:
         pass
 
     async def close(self):
-        """Clean shutdown: persist sessions, cancel compressor, close connection pool."""
-        await self.persist_sessions()
+        """Clean shutdown: cancel compressor, close connection pool."""
         if self._idle_compressor_task:
             self._idle_compressor_task.cancel()
             self._idle_compressor_task = None
@@ -242,42 +224,6 @@ class HermesClient:
             await self._client.aclose()
             self._client = None
             logger.info("[Hermes] Connection pool closed")
-
-    async def persist_sessions(self):
-        """Save all active sessions to disk for recovery after restart."""
-        if not config.memory.persist_path or not self._sessions:
-            return
-        path = Path(config.memory.persist_path)
-        path.mkdir(parents=True, exist_ok=True)
-        count = 0
-        for session_id, store in list(self._sessions.items()):
-            if len(store.messages) > 0:
-                filepath = path / f"{session_id}.json"
-                with open(filepath, "w", encoding="utf-8") as f:
-                    json.dump(store.to_dict(), f, ensure_ascii=False)
-                count += 1
-        if count:
-            logger.info(f"[Hermes] Persisted {count} sessions to {path}")
-
-    def restore_sessions(self):
-        """Load all sessions from disk (called once at startup)."""
-        if not config.memory.persist_path:
-            return
-        path = Path(config.memory.persist_path)
-        if not path.exists():
-            return
-        count = 0
-        for filepath in sorted(path.glob("*.json")):
-            try:
-                with open(filepath, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                store = SessionStore.from_dict(data)
-                self._sessions[store.session_id] = store
-                count += 1
-            except Exception as e:
-                logger.warning(f"[Hermes] Failed to restore {filepath.name}: {e}")
-        if count:
-            logger.info(f"[Hermes] Restored {count} sessions from {path}")
 
     async def _idle_compressor_loop(self):
         """Background task: compress sessions during idle periods."""
@@ -321,6 +267,7 @@ class HermesClient:
                 stream=False,
             )
             self._warmed_up = True
+            self._model_warm_at = time.time()
             logger.info("[Hermes] LLM warmup complete")
         except Exception as e:
             logger.warning(f"[Hermes] Warmup failed (non-fatal): {e}")
@@ -399,21 +346,34 @@ class HermesClient:
 
         logger.info(f"[Hermes] Stream request {log_detail}")
 
+        metrics.hermes_requests += 1
+
         full_text = ""
         last_err = None
         for attempt in range(self._MAX_RETRIES + 1):
+            _request_start = time.perf_counter()
+            _first_yield = True
             try:
                 async for chunk in self._raw_chat_stream(
                     messages=msgs,
                     session_id=session.session_id,
                     extra_headers=extra_headers,
                 ):
+                    if _first_yield:
+                        _first_yield = False
+                        ttft = time.perf_counter() - _request_start
+                        self._ttft_window.append(ttft)
+                        metrics.record_ttft(ttft)
+                        if len(self._ttft_window) > 20:
+                            self._ttft_window = self._ttft_window[-20:]
                     full_text += chunk
                     yield chunk
                 break  # success
             except (asyncio.TimeoutError, httpx.TimeoutException) as e:
                 last_err = e
                 logger.warning(f"[Hermes] Stream timeout on attempt {attempt+1}/{self._MAX_RETRIES+1}")
+                metrics.hermes_errors += 1
+                metrics.hermes_retries += 1
                 full_text = ""  # reset partial text
                 continue
         else:
@@ -441,6 +401,46 @@ class HermesClient:
             return response.status_code == 200
         except Exception:
             return False
+
+    def _get_adaptive_ttft_timeout(self) -> float:
+        """Return P80-based adaptive timeout from recent TTFT window.
+
+        Floor at 8s (covers cold start), cap at _TTFT_TIMEOUT.
+        Falls back to _TTFT_TIMEOUT when window has < 3 samples.
+        """
+        if len(self._ttft_window) < 3:
+            return self._TTFT_TIMEOUT
+        sorted_win = sorted(self._ttft_window)
+        idx = int(len(sorted_win) * 0.8)
+        p80 = sorted_win[idx]
+        return max(8.0, min(p80 * 1.5, self._TTFT_TIMEOUT))
+
+    async def ensure_warm(self):
+        """Pre-warm LLM if idle for >60s (VAD-triggered pre-warm).
+
+        During VAD buffering (user speaking), fires a quick request
+        so the model is warm by the time ASR completes and LLM starts.
+        Debounced via _warmup_lock.
+        """
+        if not self._client:
+            return
+        idle = time.time() - self._model_warm_at
+        if idle < 60:
+            return
+        async with self._warmup_lock:
+            idle = time.time() - self._model_warm_at
+            if idle < 60:
+                return
+            try:
+                logger.info(f"[Hermes] Pre-warming LLM (idle={idle:.0f}s)...")
+                await self._raw_chat(
+                    messages=[{"role": "user", "content": "你好"}],
+                    stream=False,
+                )
+                self._model_warm_at = time.time()
+                logger.info("[Hermes] Pre-warm complete")
+            except Exception as e:
+                logger.warning(f"[Hermes] Pre-warm failed (non-fatal): {e}")
 
     # ── internal ──────────────────────────────────────────────────
 
@@ -497,13 +497,15 @@ class HermesClient:
             ait = response.aiter_lines().__aiter__()
             last_data = None
 
-            # First line with TTFT timeout — prevents 27s cold-start death spiral
+            # First line with adaptive TTFT timeout — prevents cold-start death spiral
+            timeout = self._get_adaptive_ttft_timeout()
             try:
                 first_line = await asyncio.wait_for(
-                    ait.__anext__(), timeout=self._TTFT_TIMEOUT
+                    ait.__anext__(), timeout=timeout
                 )
             except asyncio.TimeoutError:
-                logger.error(f"[Hermes] TTFT timeout ({self._TTFT_TIMEOUT}s) — "
+                logger.error(f"[Hermes] TTFT timeout ({timeout:.1f}s, "
+                             f"window_size={len(self._ttft_window)}) — "
                              f"no data received")
                 raise
 
@@ -546,6 +548,10 @@ class HermesClient:
                         self._last_usage = data["usage"]
                 except json.JSONDecodeError:
                     pass
+
+            # Track model freshness for pre-warm decisions
+            self._model_warm_at = time.time()
+            self._last_request_time = time.time()
 
     @staticmethod
     def _yield_delta_chunks(data: dict):
