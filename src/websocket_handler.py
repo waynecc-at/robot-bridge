@@ -40,6 +40,9 @@ class RobotSession:
     turn_id: int = 0
     pending_task: Optional[asyncio.Task] = None
 
+    # Audio buffer for VAD-based barge-in
+    audio_buffer: list[bytes] = field(default_factory=list)
+
     # Vision / person tracking
     current_person: Optional[str] = None    # name of recognized person
     person_profiles: dict[str, dict] = field(default_factory=dict)  # multi-user: name → {name, relationship, preferences}
@@ -139,6 +142,12 @@ class RobotWebSocketHandler:
             return
 
         audio_bytes = base64.b64decode(audio_b64)
+
+        # During VAD listening: buffer chunks for batch transcription on VAD end
+        if session.is_listening:
+            session.audio_buffer.append(audio_bytes)
+            return
+
         logger.info(f"[WS] Audio received: {len(audio_bytes)} bytes")
 
         await self._send_message(session.websocket, {
@@ -165,6 +174,8 @@ class RobotWebSocketHandler:
 
         if state == "start":
             session.cancel_current_turn()
+            session.audio_buffer.clear()
+            session.is_listening = True
             await self._send_message(session.websocket, {
                 "type": "interrupt",
                 "turn": session.turn_id,
@@ -173,7 +184,16 @@ class RobotWebSocketHandler:
 
         elif state == "end":
             session.is_listening = False
-            if session.current_text:
+            if session.audio_buffer:
+                # Transcribe buffered audio chunks as one combined clip
+                logger.info(f"[WS] Transcribing {len(session.audio_buffer)} buffered chunks")
+                combined = b"".join(session.audio_buffer)
+                text = await asr_service.transcribe(combined)
+                session.audio_buffer.clear()
+                if text:
+                    session.current_text = text
+                    self._start_turn(session, text)
+            elif session.current_text:
                 self._start_turn(session, session.current_text)
 
         elif state == "speaking":
