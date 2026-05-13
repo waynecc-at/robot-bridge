@@ -344,18 +344,32 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.close(1000, "idle_timeout")
                 break
 
-            data = await asyncio.wait_for(websocket.receive_text(), timeout=5)
-            session.last_activity = time.time()
-            logger.debug(f"[WS] Received: {data[:100]}...")
-            await ws_handler._handle_message(session, data)
+            try:
+                msg = await asyncio.wait_for(websocket.receive(), timeout=5)
+            except asyncio.TimeoutError:
+                # No data for 5s — loop back to check idle timeout
+                continue
 
-    except asyncio.TimeoutError:
-        # Normal: looped around to check idle timeout
-        pass
+            session.last_activity = time.time()
+
+            if "text" in msg:
+                data = msg["text"]
+                logger.debug(f"[WS] Received text: {data[:100]}...")
+                await ws_handler._handle_message(session, data)
+            elif "bytes" in msg:
+                data = msg["bytes"]
+                logger.debug(f"[WS] Received binary: {len(data)} bytes")
+                await ws_handler._handle_message(session, data)
+            elif msg.get("type") == "websocket.disconnect":
+                logger.info("[WS] WebSocket client disconnected")
+                break
+            else:
+                logger.warning(f"[WS] Unknown message format: {list(msg.keys())}")
+
     except WebSocketDisconnect:
         logger.info("[WS] WebSocket client disconnected")
     except Exception as e:
-        logger.error(f"[WS] Error: {e}")
+        logger.opt(exception=True).error(f"[WS] Error: {e}")
     finally:
         ws_handler.sessions.pop(session_id, None)
 
@@ -368,10 +382,16 @@ class RobotSession:
         self.device_id = session_id
         self.turn_id = 0
         self.pending_task = None
-        self.last_activity = 0.0
+        self.last_activity = time.time()
         self.is_listening = False
         self.current_text = ""
         self.hermes = None
+        self.opus_decoder = None
+        self.audio_buffer: list[bytes] = []
+        self.eos_task = None
+        self.eos_timeout = 1.5
+        self.person_profiles: dict[str, dict] = {}
+        self.current_person: Optional[str] = None
 
     def cancel_current_turn(self):
         self.turn_id += 1

@@ -9,11 +9,13 @@ Optimizations v0.2:
 import asyncio
 import json
 import re
+import struct
 import time
 import base64
 from typing import Optional
 from dataclasses import dataclass, field
 from loguru import logger
+import opuslib
 
 from .asr_service import asr_service
 from .config import config
@@ -31,7 +33,7 @@ class RobotSession:
     device_id: str
     session_id: str
     websocket: object
-    last_activity: float = 0
+    last_activity: float = field(default_factory=time.time)
 
     is_listening: bool = False
     current_text: str = ""
@@ -43,6 +45,11 @@ class RobotSession:
 
     # Audio buffer for VAD-based barge-in
     audio_buffer: list[bytes] = field(default_factory=list)
+    # Opus decoder (one per session, maintains state across packets)
+    opus_decoder: Optional[object] = None
+    # End-of-speech timer for StackChan binary protocol
+    eos_task: Optional[asyncio.Task] = None
+    eos_timeout: float = 1.5  # seconds of silence to trigger end-of-speech
 
     # Vision / person tracking
     current_person: Optional[str] = None    # name of recognized person
@@ -99,11 +106,20 @@ class RobotWebSocketHandler:
             else:
                 message = json.loads(raw_message)
 
+            # XiaoZhi protocol handshake
+            if "protocolVersion" in message:
+                await self._handle_hello(session, message)
+                return
+
             msg_type = message.get("type", "unknown")
             metrics.record_ws_message(msg_type)
             logger.debug(f"[WS] Message type={msg_type} from {session.session_id}")
 
-            if msg_type == "text":
+            if msg_type == "hello":
+                await self._handle_hello(session, message)
+            elif msg_type == "listen":
+                await self._handle_listen(session, message)
+            elif msg_type == "text":
                 await self._handle_text_message(session, message)
             elif msg_type == "audio":
                 await self._handle_audio_message(session, message)
@@ -121,14 +137,41 @@ class RobotWebSocketHandler:
         except Exception as e:
             logger.error(f"[WS] Message handling error: {e}")
 
+    # StackChan binary protocol constants
+    STACKCHAN_OPUS = 0x01
+    STACKCHAN_JPEG = 0x02
+    STACKCHAN_HEARTBEAT_PONG = 0x11
+    STACKCHAN_DECLINE_CALL = 0x0A
+    STACKCHAN_ACCEPT_CALL = 0x0B
+    STACKCHAN_END_CALL = 0x0C
+
     def _parse_binary_message(self, data: bytes) -> dict:
-        msg_type = data[0] if data else 0
-        audio_data = data[1:] if len(data) > 1 else b""
-        return {
-            "type": "audio",
-            "data": base64.b64encode(audio_data).decode(),
-            "format": "pcm"
-        }
+        """Try StackChan binary protocol [1B type][4B big-endian len][N B payload].
+        If the header looks invalid (absurd length), treat as raw Opus audio."""
+        if len(data) < 5:
+            logger.warning(f"[WS] Binary message too short: {len(data)} bytes")
+            return {"type": "audio", "data": base64.b64encode(data).decode(), "format": "opus"}
+
+        msg_type = data[0]
+        payload_len = struct.unpack(">I", data[1:5])[0]
+
+        # Sanity check: if payload length exceeds remaining data, no header present
+        if payload_len > len(data) - 5:
+            logger.debug(f"[WS] Raw binary, no StackChan header: {len(data)}B, first_byte=0x{msg_type:02X}")
+            return {"type": "audio", "data": base64.b64encode(data).decode(), "format": "opus"}
+
+        payload = data[5:5 + payload_len]
+
+        if msg_type == self.STACKCHAN_OPUS:
+            return {"type": "audio", "data": base64.b64encode(payload).decode(), "format": "opus"}
+        elif msg_type == self.STACKCHAN_JPEG:
+            return {"type": "vision_frame", "data": base64.b64encode(payload).decode()}
+        elif msg_type == self.STACKCHAN_HEARTBEAT_PONG:
+            return {"type": "heartbeat_pong"}
+        else:
+            logger.debug(f"[WS] Binary type 0x{msg_type:02X}, payload={payload_len}B, first_bytes={payload[:16].hex()}")
+            return {"type": "binary_other", "code": msg_type}
+
 
     # ── message handlers ──────────────────────────────────────
 
@@ -140,26 +183,35 @@ class RobotWebSocketHandler:
 
     async def _handle_audio_message(self, session: RobotSession, message: dict):
         audio_b64 = message.get("data", "")
+        audio_format = message.get("format", "pcm")
         if not audio_b64:
             logger.warning("[WS] Empty audio data received")
             return
 
         audio_bytes = base64.b64decode(audio_b64)
 
-        # During VAD listening: buffer chunks for batch transcription on VAD end
+        # Decode Opus to PCM if needed
+        if audio_format == "opus":
+            try:
+                audio_bytes = self._decode_opus(session, audio_bytes)
+            except Exception as e:
+                logger.error(f"[WS] Opus decode error: {e}")
+                return
+
+        # During VAD listening: buffer chunks, reset end-of-speech timer
         if session.is_listening:
             session.audio_buffer.append(audio_bytes)
+            self._reset_eos_timer(session)
             return
 
+        # Immediate transcription (non-listening mode)
         logger.info(f"[WS] Audio received: {len(audio_bytes)} bytes")
-
         await self._send_message(session.websocket, {
             "type": "status",
             "message": "listening",
             "action": "listening",
             "turn": session.turn_id,
         })
-
         text = await asr_service.transcribe(audio_bytes)
         if not text:
             await self._send_message(session.websocket, {
@@ -167,9 +219,43 @@ class RobotWebSocketHandler:
                 "message": "Speech not recognized",
             })
             return
-
         session.current_text = text
         self._start_turn(session, text)
+
+    def _decode_opus(self, session: RobotSession, opus_data: bytes) -> bytes:
+        """Decode a single Opus packet to 16-bit PCM. Creates decoder on first call."""
+        if session.opus_decoder is None:
+            session.opus_decoder = opuslib.Decoder(16000, 1)
+        return session.opus_decoder.decode(opus_data, frame_size=960)
+
+    def _reset_eos_timer(self, session: RobotSession):
+        """Reset the end-of-speech timer. When it fires, process buffered audio."""
+        if session.eos_task and not session.eos_task.done():
+            session.eos_task.cancel()
+        session.eos_task = asyncio.create_task(
+            self._eos_timeout_handler(session),
+            name=f"eos-{session.session_id}",
+        )
+
+    async def _eos_timeout_handler(self, session: RobotSession):
+        """Wait for silence timeout, then process buffered audio as complete utterance."""
+        try:
+            await asyncio.sleep(session.eos_timeout)
+            if session.audio_buffer and session.is_listening:
+                chunk_count = len(session.audio_buffer)
+                combined = b"".join(session.audio_buffer)
+                session.audio_buffer.clear()
+                logger.info(f"[WS] End-of-speech: {len(combined)} bytes PCM from {chunk_count} chunks")
+                text = await asr_service.transcribe(combined)
+                if text:
+                    session.current_text = text
+                    logger.info(f"[WS] ASR result: {text[:60]}")
+                    self._start_turn(session, text)
+                else:
+                    logger.info("[WS] ASR: speech not recognized")
+                    await self._send_stackchan_text(session, "抱歉，我没听清")
+        except asyncio.CancelledError:
+            pass
 
     async def _handle_vad_message(self, session: RobotSession, message: dict):
         state = message.get("state", "unknown")
@@ -259,6 +345,56 @@ class RobotWebSocketHandler:
                 session.current_person = None
                 logger.info("[WS] All persons left frame")
 
+    async def _handle_hello(self, session: RobotSession, message: dict):
+        """Respond to XiaoZhi protocol handshake."""
+        proto_version = message.get("protocolVersion", "2024-11-05")
+        server_info = message.get("serverInfo", {})
+        device_name = server_info.get("name", "unknown")
+        device_version = server_info.get("version", "unknown")
+        logger.info(
+            f"[WS] XiaoZhi hello from {device_name} v{device_version} "
+            f"(protocol={proto_version})"
+        )
+        await self._send_message(session.websocket, {
+            "type": "hello",
+            "transport": "websocket",
+            "session_id": session.session_id,
+            "audio_params": {
+                "format": "opus",
+                "sample_rate": 16000,
+                "channels": 1,
+                "frame_duration": 60,
+            },
+        })
+
+    async def _handle_listen(self, session: RobotSession, message: dict):
+        """Acknowledge listen state from StackChan (wake-word listening mode)."""
+        state = message.get("state", "start")
+        logger.info(f"[WS] Listen state: {state} from {session.session_id}")
+
+        if state == "start":
+            session.is_listening = True
+            session.audio_buffer.clear()
+            session.cancel_current_turn()
+        elif state in ("end", "stop"):
+            session.is_listening = False
+            if session.audio_buffer:
+                combined = b"".join(session.audio_buffer)
+                session.audio_buffer.clear()
+                logger.info(f"[WS] Explicit end-of-speech: {len(combined)} bytes PCM")
+                text = await asr_service.transcribe(combined)
+                if text:
+                    session.current_text = text
+                    self._start_turn(session, text)
+            if session.eos_task and not session.eos_task.done():
+                session.eos_task.cancel()
+
+        await self._send_message(session.websocket, {
+            "type": "listen_ack",
+            "state": state,
+            "session_id": session.session_id,
+        })
+
     async def _handle_ping(self, session: RobotSession, message: dict):
         await self._send_message(session.websocket, {
             "type": "pong",
@@ -329,201 +465,48 @@ class RobotWebSocketHandler:
         return "\n".join(lines)
 
     async def _process_turn(self, session: RobotSession, text: str, turn_id: int):
-        """Concurrent pipeline: LLM stream → sentence queue → TTS worker.
-
-        LLM streaming and TTS run in parallel via asyncio.Queue.
-        Turn timeout (120s), TTS error resilience, barge-in fade-out.
-        """
+        """Simplified pipeline: LLM stream → collect response → send via StackChan TextMessage."""
         if not self.hermes:
             logger.error("[WS] Hermes client not available")
-            await self._send_message(session.websocket, {
-                "type": "error",
-                "message": "Hermes gateway not connected",
-            })
+            await self._send_stackchan_text(session, "抱歉，AI 服务未连接")
             return
 
-        heartbeat_task: Optional[asyncio.Task] = None
-
         try:
-            await self._send_message(session.websocket, {
-                "type": "status",
-                "message": "understanding",
-                "action": "thinking",
-                "turn": turn_id,
-            })
-
             logger.info(f"[WS] Turn {turn_id} processing: {text[:60]}")
 
-            # Queue coordinates LLM reader ↔ TTS worker
-            sentence_queue: asyncio.Queue = asyncio.Queue()
-
-            # Thinking heartbeat: background task, cancelled on first token
-            heartbeat_task = asyncio.create_task(
-                self._thinking_heartbeat(session, turn_id)
-            )
-
-            async def llm_reader():
-                """Stream LLM tokens → sanitize → typewriter → push sentences to queue."""
-                nonlocal heartbeat_task
-                buffer = ""
-                first_token_sent = False
-                try:
-                    async for token in self.hermes.chat_stream(
-                        message=text,
-                        session_id=session.session_id,
-                        system_prompt=self._build_system_prompt(session),
-                    ):
-                        if turn_id != session.turn_id:
-                            logger.info(f"[WS] Turn {turn_id} preempted (LLM reader)")
-                            return
-
-                        # Cancel heartbeat on first token
-                        if not first_token_sent:
-                            first_token_sent = True
-                            heartbeat_task.cancel()
-
-                        # Sanitize each token
-                        clean_token = sanitize_for_tts(token)
-                        if not clean_token:
-                            continue
-
-                        buffer += clean_token
-
-                        # Typewriter effect: per-token
-                        await self._send_message(session.websocket, {
-                            "type": "response_text",
-                            "text": clean_token,
-                            "partial": True,
-                            "turn": turn_id,
-                        })
-
-                        if turn_id != session.turn_id:
-                            return
-
-                        # Split complete sentences
-                        sentences, buffer = _split_sentences(buffer)
-                        for sentence in sentences:
-                            if sentence:
-                                await self._send_message(session.websocket, {
-                                    "type": "response_text",
-                                    "text": sentence,
-                                    "partial": False,
-                                    "turn": turn_id,
-                                })
-                                await sentence_queue.put(sentence)
-                finally:
-                    if not first_token_sent:
-                        heartbeat_task.cancel()
-
-                # Flush remaining buffer
-                if buffer.strip():
-                    sentence = buffer.strip()
-                    await self._send_message(session.websocket, {
-                        "type": "response_text",
-                        "text": sentence,
-                        "partial": False,
-                        "turn": turn_id,
-                    })
-                    await sentence_queue.put(sentence)
-
-                # Signal end of LLM output
-                await sentence_queue.put(None)
-
-            async def tts_worker():
-                """Consume sentences → TTS synthesize → stream audio."""
-                sentence_count = 0
-                while True:
-                    sentence = await sentence_queue.get()
-                    if sentence is None:
-                        break
-
+            # Collect full LLM response
+            buffer = ""
+            try:
+                async for token in self.hermes.chat_stream(
+                    message=text,
+                    session_id=session.session_id,
+                    system_prompt=self._build_system_prompt(session),
+                ):
                     if turn_id != session.turn_id:
-                        # Barge-in fade-out: send final marker so robot stops cleanly
-                        await self._send_message(session.websocket, {
-                            "type": "tts_audio", "data": "",
-                            "final": True, "turn": session.turn_id,
-                        })
+                        logger.info(f"[WS] Turn {turn_id} preempted")
                         return
+                    clean = sanitize_for_tts(token)
+                    if clean:
+                        buffer += clean
+            except Exception as e:
+                logger.error(f"[WS] LLM stream error: {e}")
 
-                    sentence_count += 1
-                    logger.info(
-                        f"[WS] Turn {turn_id} sentence {sentence_count}: {sentence[:60]}"
-                    )
+            if turn_id != session.turn_id:
+                return
 
-                    await self._send_message(session.websocket, {
-                        "type": "status",
-                        "message": "speaking",
-                        "action": "speaking",
-                        "turn": turn_id,
-                    })
+            response = buffer.strip()
+            if response:
+                logger.info(f"[WS] Turn {turn_id} response: {response[:60]}")
+                await self._send_stackchan_text(session, response)
+            else:
+                await self._send_stackchan_text(session, "嗯？")
 
-                    # TTS with error resilience — don't crash pipeline
-                    metrics.tts_requests += 1
-                    try:
-                        async for chunk in tts_service.synthesize_stream(sentence):
-                            if turn_id != session.turn_id:
-                                await self._send_message(session.websocket, {
-                                    "type": "tts_audio", "data": "",
-                                    "final": True, "turn": session.turn_id,
-                                })
-                                return
-                            # Header text frame, then audio data as binary frame
-                            await self._send_message(session.websocket, {
-                                "type": "tts_audio",
-                                "format": "wav",
-                                "final": False,
-                                "turn": turn_id,
-                            })
-                            metrics.tts_audio_bytes += len(chunk)
-                            await session.websocket.send_bytes(chunk)
-                    except Exception as e:
-                        metrics.tts_errors += 1
-                        logger.warning(f"[WS] TTS failed for sentence, skipping: {e}")
-                        continue
-
-                # Final marker
-                if turn_id == session.turn_id:
-                    await self._send_message(session.websocket, {
-                        "type": "tts_audio",
-                        "data": "",
-                        "final": True,
-                        "turn": turn_id,
-                    })
-                    logger.info(f"[WS] Turn {turn_id} complete: {sentence_count} sentences")
-
-            # Run both tasks with turn-level timeout
-            await asyncio.wait_for(
-                asyncio.gather(llm_reader(), tts_worker()),
-                timeout=120,
-            )
-
-        except asyncio.TimeoutError:
-            logger.warning(f"[WS] Turn {turn_id} timed out (120s)")
-            if heartbeat_task:
-                heartbeat_task.cancel()
-            if turn_id == session.turn_id:
-                await self._send_message(session.websocket, {
-                    "type": "status", "message": "timeout",
-                    "action": "idle", "turn": turn_id,
-                })
         except asyncio.CancelledError:
-            logger.info(f"[WS] Turn {turn_id} cancelled (CancelledError)")
-            if heartbeat_task:
-                heartbeat_task.cancel()
-            if turn_id == session.turn_id:
-                await self._send_message(session.websocket, {
-                    "type": "interrupt",
-                    "turn": session.turn_id,
-                })
+            logger.info(f"[WS] Turn {turn_id} cancelled")
         except Exception as e:
-            logger.error(f"[WS] Turn {turn_id} processing error: {e}")
-            if heartbeat_task:
-                heartbeat_task.cancel()
+            logger.error(f"[WS] Turn {turn_id} error: {e}")
             if turn_id == session.turn_id:
-                await self._send_message(session.websocket, {
-                    "type": "error",
-                    "message": f"Error: {str(e)}",
-                })
+                await self._send_stackchan_text(session, f"出错了：{e}")
 
     # ── utilities ─────────────────────────────────────────────
 
@@ -532,6 +515,20 @@ class RobotWebSocketHandler:
             await websocket.send_text(json.dumps(message))
         except Exception as e:
             logger.error(f"[WS] Send error: {e}")
+
+    async def _send_stackchan_binary(self, websocket, data_type: int, payload: bytes = b""):
+        """Send a StackChan binary protocol packet: [1B type][4B big-endian len][N B payload]"""
+        header = bytes([data_type]) + struct.pack(">I", len(payload))
+        try:
+            await websocket.send_bytes(header + payload)
+        except Exception as e:
+            logger.error(f"[WS] StackChan send error: {e}")
+
+    async def _send_stackchan_text(self, session: RobotSession, content: str, name: str = "叁叁"):
+        """Send a text response via StackChan TextMessage (0x07)."""
+        payload = json.dumps({"name": name, "content": content}, ensure_ascii=False).encode('utf-8')
+        await self._send_stackchan_binary(session.websocket, 0x07, payload)
+        logger.info(f"[WS] StackChan text sent: {content[:40]}")
 
     async def broadcast(self, message: dict):
         for session in self.sessions.values():
