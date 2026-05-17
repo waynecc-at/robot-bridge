@@ -1,0 +1,15 @@
+# Hermes Profile: stackchan
+# 叁叁语音机器人 — 通过 MCP 控制 StackChan
+
+model:
+  default: deepseek/deepseek-v4-flash
+  provider: deepseek
+
+terminal:
+  cwd: /home/wayne/robot-bridge
+
+mcp_servers:
+  stackchan:
+    command: "/home/wayne/robot-bridge/.venv/bin/python"
+    args: ["-m", "src.mcp_server"]
+    timeout: 60

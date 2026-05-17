@@ -14,6 +14,9 @@ from pathlib import Path
 from typing import AsyncGenerator, Optional
 from loguru import logger
 
+import numpy as np
+from scipy import signal as scipy_signal
+
 from .config import config
 
 
@@ -105,6 +108,49 @@ class TTSService:
         logger.info(f"[TTS] Generated {len(wav_bytes)} bytes of WAV audio "
                     f"(duration: {len(audio.samples)/audio.sample_rate:.2f}s)")
         return wav_bytes
+
+    async def synthesize_pcm(self, text: str) -> bytes:
+        """Synthesize text directly to 16kHz int16 PCM.
+
+        Pipeline: float32[22050] → int16 PCM → ffmpeg soxr → int16 PCM[16000]
+        Uses ffmpeg soxr for high-quality anti-aliased resampling (lower noise than FFT).
+        """
+        if not self._ready:
+            raise RuntimeError("TTS service not initialized")
+
+        audio = await self._generate(text)
+        pcm_bytes = await self._resample_via_ffmpeg(audio.samples, audio.sample_rate)
+        return pcm_bytes
+
+    @staticmethod
+    async def _resample_via_ffmpeg(samples, src_rate: int, target_rate: int = 16000) -> bytes:
+        """Resample via ffmpeg soxr — float32 PCM pipe, resample, int16 PCM out."""
+        # Feed float32 PCM directly to ffmpeg (no pre-quantization)
+        arr = np.array(samples, dtype=np.float32)
+        arr = np.clip(arr, -1.0, 1.0)
+        pcm_in = arr.astype(np.float32).tobytes()
+
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-f", "f32le", "-ar", str(src_rate), "-ac", "1", "-i", "pipe:0",
+            "-resampler", "soxr",
+            "-ar", str(target_rate), "-ac", "1",
+            "-sample_fmt", "s16", "-f", "s16le",
+            "pipe:1",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await proc.communicate(pcm_in)
+        if proc.returncode == 0:
+            return stdout
+        # Fallback: if ffmpeg fails, use scipy as backup
+        logger.warning("[TTS] ffmpeg soxr unavailable, falling back to scipy")
+        from scipy import signal as _scipy_signal
+        num = int(len(samples) * target_rate / src_rate)
+        fallback = _scipy_signal.resample(arr, num)
+        fallback = np.clip(fallback, -1.0, 1.0)
+        return (fallback * 32767).astype(np.int16).tobytes()
 
     async def synthesize_stream(
         self,

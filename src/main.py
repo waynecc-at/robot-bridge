@@ -69,7 +69,6 @@ def run_server():
     logger.info("")
     logger.info("Available endpoints:")
     logger.info("  GET  /health           - Health check")
-    logger.info("  POST /api/chat         - Chat with Hermes")
     logger.info("  POST /api/tts          - Text to Speech")
     logger.info("  POST /api/tts/stream   - TTS Streaming")
     logger.info("  GET  /api/voices       - List TTS voices")

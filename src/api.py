@@ -15,19 +15,12 @@ from pydantic import BaseModel
 
 from .asr_service import asr_service
 from .config import config
-from .hermes_client import hermes_client
 from .metrics import metrics
 from .tts_service import tts_service
 from .vision_service import vision_service
 
 
 # Pydantic models
-class ChatRequest(BaseModel):
-    message: str
-    session_id: Optional[str] = None
-    stream: bool = True
-
-
 class TTSRequest(BaseModel):
     text: str
     voice: Optional[str] = None
@@ -42,7 +35,7 @@ class WebSocketMessage(BaseModel):
 # Lifespan for startup/shutdown
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    from .websocket_handler import ws_handler
+    from .websocket_handler import ws_handler, RobotSession
 
     logger.info("Robot Bridge API starting...")
 
@@ -54,7 +47,6 @@ async def lifespan(app: FastAPI):
     asr_service.set_executor(executor)
     tts_service.set_executor(executor)
 
-    await hermes_client.__aenter__()
     await asr_service.start()
     await tts_service.start()
 
@@ -74,7 +66,6 @@ async def lifespan(app: FastAPI):
     yield
 
     cleanup_task.cancel()
-    await hermes_client.close()
     executor.shutdown(wait=True)
     logger.info("Robot Bridge API shutting down...")
 
@@ -93,14 +84,10 @@ app = FastAPI(
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
-    async with hermes_client as hermes:
-        hermes_healthy = await hermes.check_health()
-    
     return {
         "status": "healthy",
         "service": "robot-bridge",
         "version": "0.1.0",
-        "hermes_connected": hermes_healthy
     }
 
 
@@ -111,12 +98,31 @@ async def root():
         "service": "Robot Bridge",
         "version": "0.1.0",
         "endpoints": {
-            "chat": "/api/chat",
             "tts": "/api/tts",
             "tts_stream": "/api/tts/stream",
             "websocket": "/ws/robot",
             "voices": "/api/voices",
         }
+    }
+
+
+@app.api_route("/ota", methods=["GET", "POST"])
+async def ota_config():
+    """OTA configuration endpoint for ESP32 firmware.
+
+    ESP32 fetches this on boot to get the WebSocket URL and server time.
+    Replaces the temporary /tmp/ota_server.py script on port 8884.
+    """
+    import datetime
+    return {
+        "websocket": {
+            "url": "ws://192.168.50.32:8081/ws/robot",
+            "version": 1,
+        },
+        "server_time": {
+            "timestamp": int(datetime.datetime.now().timestamp() * 1000),
+            "timezone_offset": 480,  # UTC+8 minutes
+        },
     }
 
 
@@ -133,65 +139,6 @@ async def api_metrics_prometheus():
         content=metrics.prometheus(),
         media_type="text/plain; charset=utf-8",
     )
-
-
-# ============= Chat Endpoints =============
-
-@app.post("/api/chat")
-async def chat(request: ChatRequest):
-    if request.stream:
-        return StreamingResponse(
-            stream_chat_response(request.message, request.session_id),
-            media_type="application/json"
-        )
-
-    async with hermes_client as hermes:
-        logger.info(f"[API] Chat request: {request.message[:50]}...")
-        response = await hermes.chat(
-            message=request.message,
-            session_id=request.session_id,
-            system_prompt=config.robot.system_prompt,
-        )
-        return JSONResponse({
-            "text": response.text,
-            "session_id": response.session_id,
-        })
-
-
-async def stream_chat_response(message: str, session_id: Optional[str]):
-    """Stream chat response with TTS audio (WAV format)"""
-    async with hermes_client as hermes:
-        # Get Hermes response
-        response = await hermes.chat(
-            message=message,
-            session_id=session_id,
-            system_prompt=config.robot.system_prompt,
-        )
-
-        response_text = response.text
-
-        # Send text first
-        yield json.dumps({
-            "type": "text",
-            "text": response_text,
-            "session_id": response.session_id
-        }) + "\n"
-
-        # Then stream TTS audio (WAV chunks)
-        async for chunk in tts_service.synthesize_stream(response_text):
-            yield json.dumps({
-                "type": "audio",
-                "format": "wav",
-                "data": base64.b64encode(chunk).decode(),
-                "final": False
-            }) + "\n"
-
-        # Final marker
-        yield json.dumps({
-            "type": "audio",
-            "data": "",
-            "final": True
-        }) + "\n"
 
 
 # ============= TTS Endpoints =============
@@ -304,33 +251,119 @@ async def delete_profile(name: str):
     return {"status": "ok" if ok else "not_found"}
 
 
+# ============= Internal API (MCP fallback for separate process) =============
+from pydantic import BaseModel as PydanticBase
+
+class InternalSpeakReq(PydanticBase):
+    text: str
+    emotion: str = "neutral"
+
+class InternalLedReq(PydanticBase):
+    red: int = 0
+    green: int = 0
+    blue: int = 0
+    rainbow: bool = False
+
+class InternalLookReq(PydanticBase):
+    yaw: int = 0
+    pitch: int = 30
+    speed: int = 200
+
+class InternalEmoteReq(PydanticBase):
+    emotion: str = "neutral"
+
+@app.post("/internal/speak")
+async def internal_speak(req: InternalSpeakReq):
+    from .websocket_handler import ws_handler
+    session = _get_active_ws_session(ws_handler)
+    if not session: return {"error": "No ESP32 connected"}
+    asyncio.create_task(ws_handler._tts_and_send(session, req.text))
+    return {"status": "ok"}
+
+@app.post("/internal/led")
+async def internal_led(req: InternalLedReq):
+    from .websocket_handler import ws_handler
+    session = _get_active_ws_session(ws_handler)
+    if not session: return {"error": "No ESP32 connected"}
+    if req.rainbow:
+        ws_handler._start_rainbow(session)
+    else:
+        ws_handler._stop_rainbow(session)
+        ws_handler._set_led(session, req.red, req.green, req.blue)
+    return {"status": "ok"}
+
+@app.post("/internal/look")
+async def internal_look(req: InternalLookReq):
+    from .websocket_handler import ws_handler
+    from .face_tracker import face_tracker
+    session = _get_active_ws_session(ws_handler)
+    if not session: return {"error": "No ESP32 connected"}
+    face_tracker.pause(4.0)
+    asyncio.create_task(ws_handler._send_mcp_async(
+        session, "self.robot.set_head_angles",
+        {"yaw": req.yaw, "pitch": req.pitch, "speed": req.speed},
+    ))
+    return {"status": "ok"}
+
+@app.post("/internal/emote")
+async def internal_emote(req: InternalEmoteReq):
+    from .websocket_handler import ws_handler
+    session = _get_active_ws_session(ws_handler)
+    if not session: return {"error": "No ESP32 connected"}
+    await ws_handler._send_json(session.websocket, {
+        "type": "llm", "emotion": req.emotion,
+        "session_id": session.session_id,
+    })
+    return {"status": "ok"}
+
+@app.post("/internal/idle")
+async def internal_idle():
+    from .websocket_handler import ws_handler
+    session = _get_active_ws_session(ws_handler)
+    if not session: return {"error": "No ESP32 connected"}
+    session.cancel_current_turn()
+    ws_handler._stop_rainbow(session)
+    ws_handler._set_led(session, 0, 0, 0)
+    return {"status": "ok"}
+
+def _get_active_ws_session(ws_handler):
+    if not ws_handler.sessions: return None
+    sessions = sorted(ws_handler.sessions.values(),
+                      key=lambda s: getattr(s, 'last_activity', 0), reverse=True)
+    return sessions[0] if sessions else None
+
+
+# ============= MCP Endpoint =============
+
+from .mcp_router import router as mcp_router
+app.include_router(mcp_router)
+
+
 # ============= WebSocket Endpoint =============
 
-WS_IDLE_TIMEOUT = 300  # seconds without activity → goodbye + close
+WS_IDLE_TIMEOUT = 600  # seconds without activity
 
 @app.websocket("/ws/robot")
 async def websocket_endpoint(websocket: WebSocket):
-    """
-    WebSocket endpoint for ESP32 connections.
-
-    Continuous conversation mode: once connected, no wake word needed.
-    Idle for 5 minutes → sends goodbye message and closes.
-    ESP32 should return to low-power wake-word listening on close.
-
-    Protocol:
-    - Send: {"type": "text", "text": "Hello"}
-    - Receive: {"type": "response_text", "text": "Hi there!"}
-    - Receive: {"type": "tts_audio", "data": "base64...", "final": false}
-    """
-    from .websocket_handler import ws_handler
+    """XiaoZhi-protocol WebSocket endpoint for ESP32 StackChan devices."""
+    from .websocket_handler import ws_handler, RobotSession
 
     await websocket.accept()
     logger.info("[WS] WebSocket client connected")
 
-    await ws_handler.set_hermes_client(hermes_client)
+    # Register MCP server with WebSocket handler (for forwarding tool calls to ESP32)
+    from .mcp_server import tools as mcp_tools
+    mcp_tools.set_ws_handler(ws_handler)
 
+
+    # Hermes webhook handles ASR → LLM → TTS.
+    # Agent Driver is deleted — see websocket_handler._post_webhook().
+
+    # Use Device-Id header (ESP32 MAC) as stable identity for cross-session pending responses
+    device_id = websocket.headers.get("device-id", "") or str(uuid.uuid4())[:12]
     session_id = str(uuid.uuid4())[:8]
-    session = RobotSession(websocket=websocket, session_id=session_id)
+    session = RobotSession(websocket=websocket, session_id=session_id, device_id=device_id)
+    logger.info(f"[WS] Device {device_id} session {session_id}")
     ws_handler.sessions[session_id] = session
 
     try:
@@ -338,28 +371,19 @@ async def websocket_endpoint(websocket: WebSocket):
             idle = time.time() - session.last_activity
             if idle > WS_IDLE_TIMEOUT:
                 logger.info(f"[WS] Session {session_id} idle timeout ({idle:.0f}s)")
-                await ws_handler._send_message(websocket, {
-                    "type": "goodbye", "reason": "idle_timeout",
-                })
-                await websocket.close(1000, "idle_timeout")
                 break
 
             try:
                 msg = await asyncio.wait_for(websocket.receive(), timeout=5)
             except asyncio.TimeoutError:
-                # No data for 5s — loop back to check idle timeout
                 continue
 
             session.last_activity = time.time()
 
             if "text" in msg:
-                data = msg["text"]
-                logger.debug(f"[WS] Received text: {data[:100]}...")
-                await ws_handler._handle_message(session, data)
+                await ws_handler._handle_message(session, msg["text"])
             elif "bytes" in msg:
-                data = msg["bytes"]
-                logger.debug(f"[WS] Received binary: {len(data)} bytes")
-                await ws_handler._handle_message(session, data)
+                await ws_handler._handle_message(session, msg["bytes"])
             elif msg.get("type") == "websocket.disconnect":
                 logger.info("[WS] WebSocket client disconnected")
                 break
@@ -371,29 +395,13 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception as e:
         logger.opt(exception=True).error(f"[WS] Error: {e}")
     finally:
+        # Cleanup on disconnect
+        try:
+            await ws_handler.process_on_disconnect(session)
+        except Exception:
+            pass
         ws_handler.sessions.pop(session_id, None)
 
 
-class RobotSession:
-    """Helper class for HTTP WebSocket handling, compatible with handler's session protocol"""
-    def __init__(self, websocket: WebSocket, session_id: str):
-        self.websocket = websocket
-        self.session_id = session_id
-        self.device_id = session_id
-        self.turn_id = 0
-        self.pending_task = None
-        self.last_activity = time.time()
-        self.is_listening = False
-        self.current_text = ""
-        self.hermes = None
-        self.opus_decoder = None
-        self.audio_buffer: list[bytes] = []
-        self.eos_task = None
-        self.eos_timeout = 1.5
-        self.person_profiles: dict[str, dict] = {}
-        self.current_person: Optional[str] = None
 
-    def cancel_current_turn(self):
-        self.turn_id += 1
-        if self.pending_task and not self.pending_task.done():
-            self.pending_task.cancel()
+    # RobotSession is imported from websocket_handler (single source of truth)

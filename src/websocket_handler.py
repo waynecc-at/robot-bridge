@@ -1,541 +1,692 @@
-"""WebSocket handler for robot connections with concurrent LLM+TTS pipeline.
+"""WebSocket handler — XiaoZhi protocol server-side for StackChan ESP32 devices.
 
-Optimizations v0.2:
-- Concurrent pipeline: LLM stream reader + TTS worker via asyncio.Queue
-- LLM sentence N+1 generation overlaps with TTS playback of sentence N
-- Thread pool offloaded ASR/TTS (via service layer)
-- Turn-id barge-in checking preserved at all yield points
+Protocol (xiaozhi-esp32):
+  Client hello: {"type":"hello","version":1,"transport":"websocket","audio_params":{...}}
+  Server hello: {"type":"hello","session_id":"...","audio_params":{...}}
+  Listen start: {"type":"listen","state":"start","mode":"auto"}
+  Listen stop:  {"type":"listen","state":"stop"}  (VAD silence trigger)
+  Raw Opus audio in binary WS frames while listening (version 1: no header)
+
+  Server → Device:
+    {"type":"stt","text":"..."}        — display recognised speech
+    {"type":"llm","emotion":"neutral"} — set facial emotion
+    {"type":"tts","state":"start"}     — begin TTS playback
+    <binary Opus frames>               — TTS audio
+    {"type":"tts","state":"stop"}      — end TTS playback
 """
 import asyncio
+import io
 import json
-import re
-import struct
 import time
-import base64
 from typing import Optional
 from dataclasses import dataclass, field
 from loguru import logger
+
 import opuslib
 
 from .asr_service import asr_service
 from .config import config
-from .hermes_client import HermesClient
+from .face_registry import face_registry
+from .face_tracker import face_tracker
 from .metrics import metrics
 from .profile_store import profile_store
-from .text_utils import sanitize_for_tts
 from .tts_service import tts_service
 from .vision_service import vision_service
 
 
+OPUS_SR = 16000       # Opus sample rate
+OPUS_CHANNELS = 1
+OPUS_FRAME_MS = 60    # frame duration
+FRAME_SAMPLES = OPUS_SR * OPUS_FRAME_MS // 1000  # 960
+FRAME_BYTES = FRAME_SAMPLES * 2                   # 1920
+
+
 @dataclass
 class RobotSession:
-    """Represents a connected robot device with turn management"""
     device_id: str
     session_id: str
     websocket: object
     last_activity: float = field(default_factory=time.time)
+    last_asr_text: str = ""  # Latest ASR result, read by MCP listen() tool
+    messages: list = field(default_factory=list)  # Conversation history for LLM
 
     is_listening: bool = False
     current_text: str = ""
-    hermes: Optional[HermesClient] = None
 
-    # Barge-in turn management
     turn_id: int = 0
     pending_task: Optional[asyncio.Task] = None
-
-    # Audio buffer for VAD-based barge-in
     audio_buffer: list[bytes] = field(default_factory=list)
-    # Opus decoder (one per session, maintains state across packets)
     opus_decoder: Optional[object] = None
-    # End-of-speech timer for StackChan binary protocol
     eos_task: Optional[asyncio.Task] = None
-    eos_timeout: float = 1.5  # seconds of silence to trigger end-of-speech
 
-    # Vision / person tracking
-    current_person: Optional[str] = None    # name of recognized person
-    person_profiles: dict[str, dict] = field(default_factory=dict)  # multi-user: name → {name, relationship, preferences}
+    # multi-user vision
+    current_person: Optional[str] = None
+    person_profiles: dict[str, dict] = field(default_factory=dict)
+    unknown_face_pending: bool = False    # set when face_registry signals a new person
+    last_conversation: str = ""           # user+assistant text from latest turn
+    _led_task: Optional[asyncio.Task] = None
+    _tts_stop: Optional[asyncio.Event] = None  # set to cancel in-progress TTS stream
+
+    # Idle mode — when True, auto-listen is suppressed (user said goodbye)
+    idle_mode: bool = False
 
     def cancel_current_turn(self):
-        """Cancel the active turn so a new one can start"""
         self.turn_id += 1
+        # Cancel in-progress TTS stream
+        if self._tts_stop:
+            self._tts_stop.set()
         if self.pending_task and not self.pending_task.done():
             self.pending_task.cancel()
             metrics.turns_cancelled += 1
             logger.info(f"[WS] Turn cancelled: new turn_id={self.turn_id}")
 
 
-def _split_sentences(buffer: str) -> list[str]:
-    """Split text buffer into complete sentences at Chinese punctuation."""
-    sentences = []
-    while True:
-        m = re.search(r"(.+?[。！？\n])", buffer)
-        if not m:
-            break
-        sentences.append(m.group(1).strip())
-        buffer = buffer[m.end():]
-    return sentences, buffer
-
-
 class RobotWebSocketHandler:
-    """Handles WebSocket connections from robot devices with concurrent pipeline"""
-
     def __init__(self):
         self.sessions: dict[str, RobotSession] = {}
-        self.hermes: Optional[HermesClient] = None
+        # pending response carried across reconnects (keyed by device MAC)
+        self._pending: dict[str, str] = {}
+        # Webhook URL for Hermes Agent (replaces Agent Driver callbacks)
+        self._webhook_url = "http://127.0.0.1:8644/webhooks/stackchan"
 
-    async def set_hermes_client(self, client: HermesClient):
-        self.hermes = client
-
-    async def cleanup_stale_sessions(self, ttl: float = 300):
+    async def cleanup_stale_sessions(self, ttl: float = 600):
         now = time.time()
-        stale = [
-            sid for sid, s in self.sessions.items()
-            if now - s.last_activity > ttl
-        ]
+        stale = [sid for sid, s in self.sessions.items() if now - s.last_activity > ttl]
         for sid in stale:
-            session = self.sessions[sid]
-            session.cancel_current_turn()
+            self.sessions[sid].cancel_current_turn()
             del self.sessions[sid]
-            logger.info(f"[WS] Stale session cleaned up: {sid}")
+            logger.info(f"[WS] Stale session cleaned: {sid}")
 
-    async def _handle_message(self, session: RobotSession, raw_message: str | bytes):
+    # ── message dispatch ──────────────────────────────────────
+
+    async def _handle_message(self, session: RobotSession, raw: str | bytes):
         session.last_activity = time.time()
         try:
-            if isinstance(raw_message, bytes):
-                message = self._parse_binary_message(raw_message)
+            if isinstance(raw, bytes):
+                # Check for binary DataType::Jpeg frame (0x02 + 4-byte BE length)
+                if len(raw) >= 5 and raw[0] == 0x02:
+                    await self._handle_jpeg_frame(session, raw)
+                    return
+                msg = {"type": "audio", "data": raw, "format": "opus"}
             else:
-                message = json.loads(raw_message)
+                msg = json.loads(raw)
 
-            # XiaoZhi protocol handshake
-            if "protocolVersion" in message:
-                await self._handle_hello(session, message)
+            # XiaoZhi hello (has "version" or "type":"hello" + "audio_params")
+            if msg.get("type") == "hello":
+                await self._handle_hello(session, msg)
                 return
-
-            msg_type = message.get("type", "unknown")
-            metrics.record_ws_message(msg_type)
-            logger.debug(f"[WS] Message type={msg_type} from {session.session_id}")
-
-            if msg_type == "hello":
-                await self._handle_hello(session, message)
-            elif msg_type == "listen":
-                await self._handle_listen(session, message)
-            elif msg_type == "text":
-                await self._handle_text_message(session, message)
-            elif msg_type == "audio":
-                await self._handle_audio_message(session, message)
-            elif msg_type == "vad":
-                await self._handle_vad_message(session, message)
-            elif msg_type == "vision_frame":
-                await self._handle_vision_frame(session, message)
-            elif msg_type == "ping":
-                await self._handle_ping(session, message)
-            else:
-                logger.warning(f"[WS] Unknown message type: {msg_type}")
-
+            if msg.get("type") == "listen":
+                await self._handle_listen(session, msg)
+                return
+            if msg.get("type") == "audio":
+                await self._handle_audio(session, msg)
+                return
+            if msg.get("type") == "abort":
+                logger.info(f"[WS] Abort: {msg.get('reason','')}")
+                session.cancel_current_turn()
+                self._stop_rainbow(session)
+                return
+            if msg.get("type") == "mcp":
+                await self._handle_mcp_response(session, msg)
+                return
+            if msg.get("type") == "vision_frame":
+                await self._handle_vision_frame(session, msg)
+                return
+            if msg.get("type") == "ping":
+                await self._send_json(session.websocket, {"type": "pong"})
+                return
+            logger.warning(f"[WS] Unknown message type: {msg.get('type','?')}")
         except json.JSONDecodeError:
-            logger.error(f"[WS] Invalid JSON: {raw_message[:100]}")
+            logger.error(f"[WS] Invalid JSON: {raw[:100] if isinstance(raw, str) else raw[:20].hex()}")
         except Exception as e:
             logger.error(f"[WS] Message handling error: {e}")
 
-    # StackChan binary protocol constants
-    STACKCHAN_OPUS = 0x01
-    STACKCHAN_JPEG = 0x02
-    STACKCHAN_HEARTBEAT_PONG = 0x11
-    STACKCHAN_DECLINE_CALL = 0x0A
-    STACKCHAN_ACCEPT_CALL = 0x0B
-    STACKCHAN_END_CALL = 0x0C
+    # ── XiaoZhi protocol handlers ─────────────────────────────
 
-    def _parse_binary_message(self, data: bytes) -> dict:
-        """Try StackChan binary protocol [1B type][4B big-endian len][N B payload].
-        If the header looks invalid (absurd length), treat as raw Opus audio."""
-        if len(data) < 5:
-            logger.warning(f"[WS] Binary message too short: {len(data)} bytes")
-            return {"type": "audio", "data": base64.b64encode(data).decode(), "format": "opus"}
+    async def _handle_hello(self, session: RobotSession, msg: dict):
+        version = msg.get("version", 1)
+        transport = msg.get("transport", "websocket")
+        audio = msg.get("audio_params", {})
+        logger.info(f"[WS] XiaoZhi hello v{version} {transport} "
+                    f"sr={audio.get('sample_rate')} ch={audio.get('channels')}")
 
-        msg_type = data[0]
-        payload_len = struct.unpack(">I", data[1:5])[0]
+        # carry pending response from previous session
+        pending = self._pending.pop(session.device_id, None)
 
-        # Sanity check: if payload length exceeds remaining data, no header present
-        if payload_len > len(data) - 5:
-            logger.debug(f"[WS] Raw binary, no StackChan header: {len(data)}B, first_byte=0x{msg_type:02X}")
-            return {"type": "audio", "data": base64.b64encode(data).decode(), "format": "opus"}
-
-        payload = data[5:5 + payload_len]
-
-        if msg_type == self.STACKCHAN_OPUS:
-            return {"type": "audio", "data": base64.b64encode(payload).decode(), "format": "opus"}
-        elif msg_type == self.STACKCHAN_JPEG:
-            return {"type": "vision_frame", "data": base64.b64encode(payload).decode()}
-        elif msg_type == self.STACKCHAN_HEARTBEAT_PONG:
-            return {"type": "heartbeat_pong"}
-        else:
-            logger.debug(f"[WS] Binary type 0x{msg_type:02X}, payload={payload_len}B, first_bytes={payload[:16].hex()}")
-            return {"type": "binary_other", "code": msg_type}
-
-
-    # ── message handlers ──────────────────────────────────────
-
-    async def _handle_text_message(self, session: RobotSession, message: dict):
-        text = message.get("text", "")
-        logger.info(f"[WS] Text input: {text}")
-        session.current_text = text
-        self._start_turn(session, text)
-
-    async def _handle_audio_message(self, session: RobotSession, message: dict):
-        audio_b64 = message.get("data", "")
-        audio_format = message.get("format", "pcm")
-        if not audio_b64:
-            logger.warning("[WS] Empty audio data received")
-            return
-
-        audio_bytes = base64.b64decode(audio_b64)
-
-        # Decode Opus to PCM if needed
-        if audio_format == "opus":
-            try:
-                audio_bytes = self._decode_opus(session, audio_bytes)
-            except Exception as e:
-                logger.error(f"[WS] Opus decode error: {e}")
-                return
-
-        # During VAD listening: buffer chunks, reset end-of-speech timer
-        if session.is_listening:
-            session.audio_buffer.append(audio_bytes)
-            self._reset_eos_timer(session)
-            return
-
-        # Immediate transcription (non-listening mode)
-        logger.info(f"[WS] Audio received: {len(audio_bytes)} bytes")
-        await self._send_message(session.websocket, {
-            "type": "status",
-            "message": "listening",
-            "action": "listening",
-            "turn": session.turn_id,
+        await self._send_json(session.websocket, {
+            "type": "hello",
+            "session_id": session.session_id,
+            "transport": "websocket",
+            "audio_params": {
+                "format": "opus",
+                "sample_rate": OPUS_SR,
+                "channels": OPUS_CHANNELS,
+                "frame_duration": OPUS_FRAME_MS,
+            },
         })
-        text = await asr_service.transcribe(audio_bytes)
-        if not text:
-            await self._send_message(session.websocket, {
-                "type": "error",
-                "message": "Speech not recognized",
-            })
+        # Start camera stream for face detection/tracking
+        asyncio.create_task(self._start_camera(session))
+
+        if pending:
+            asyncio.create_task(self._deliver_pending(session, pending))
+
+    async def _deliver_pending(self, session: RobotSession, text: str):
+        """Send a previously-computed response to a reconnected device."""
+        await asyncio.sleep(0.5)  # let hello processing settle
+        logger.info(f"[WS] Delivering pending: {text[:40]}")
+        await self._send_json(session.websocket, {
+            "type": "stt", "text": text, "session_id": session.session_id,
+        })
+        await self._send_json(session.websocket, {
+            "type": "llm", "emotion": "neutral", "session_id": session.session_id,
+        })
+        await self._tts_and_send(session, text)
+
+    async def _handle_listen(self, session: RobotSession, msg: dict):
+        state = msg.get("state", "start")
+        mode = msg.get("mode", "manual")
+        logger.info(f"[WS] Listen {state} mode={mode}")
+
+        if state == "start":
+            if session.idle_mode:
+                logger.info("[WS] Idle mode — ignoring auto-listen")
+                return
+            # Don't start listening during TTS — wait for TTS to finish first.
+            # Prevents green LED from overwriting blue LED mid-speech.
+            if session._tts_stop and not session._tts_stop.is_set():
+                return
+            session.is_listening = True
+            session.audio_buffer.clear()
+            if session.eos_task and not session.eos_task.done():
+                session.eos_task.cancel()
+            self._stop_rainbow(session)
+            self._set_led(session, 0, 168, 0)  # Green = listening
+        elif state == "stop":
+            session.is_listening = False
+            self._set_led(session, 0, 0, 0)  # LED off
+        elif state == "detect":
+            logger.info(f"[WS] Wake word: {msg.get('text','')}")
+            # Exit idle mode on wake word
+            if session.idle_mode:
+                session.idle_mode = False
+                logger.info("[WS] Exiting idle mode")
+            # Flash green to confirm wake — hold for 1.5s
+            self._stop_rainbow(session)
+            self._set_led(session, 0, 168, 0)
+            # Schedule off (rainbow will override if speech follows)
+            asyncio.create_task(self._led_off_after(session, 1.8))
+            # Notify Hermes webhook of wake word
+            asyncio.create_task(self._post_webhook(session, "叁叁"))
+
+    async def _handle_audio(self, session: RobotSession, msg: dict):
+        """Raw Opus audio in binary frames — decode, buffer all.
+        Only reset EOS timer on non-silence chunks (DTX sends silence packets).
+        If speech arrives while TTS is playing, barge-in (interrupt TTS)."""
+        if not session.is_listening:
+            # Barge-in: if TTS is playing and user speaks, interrupt
+            if hasattr(session, '_tts_stop') and session._tts_stop and not session._tts_stop.is_set():
+                opus_data = msg["data"] if isinstance(msg["data"], bytes) else msg.get("data")
+                if opus_data:
+                    try:
+                        if isinstance(opus_data, str):
+                            import base64
+                            opus_data = base64.b64decode(opus_data)
+                        pcm = self._opus_decode(session, opus_data)
+                        silent, rms = _is_silence(pcm)
+                        if not silent:
+                            logger.info(f"[WS] Barge-in detected (RMS={rms:.0f}) — interrupting TTS")
+                            session._tts_stop.set()
+                            session.cancel_current_turn()
+                            session.is_listening = True
+                            session.audio_buffer.clear()
+                            session.last_asr_text = ""
+                            self._reset_eos(session)
+                    except Exception:
+                        pass
+                return
+            # No TTS, but audio is arriving — auto-start listening.
+            # Covers the gap between ASR completion and next listen start where
+            # ESP32 auto-listen hasn't fired yet but the user is already speaking.
+            opus_data = msg["data"] if isinstance(msg["data"], bytes) else msg.get("data")
+            if opus_data:
+                try:
+                    if isinstance(opus_data, str):
+                        import base64
+                        opus_data = base64.b64decode(opus_data)
+                    pcm = self._opus_decode(session, opus_data)
+                    silent, rms = _is_silence(pcm)
+                    if not silent:
+                        logger.info(f"[WS] Pre-listen audio (RMS={rms:.0f}) — starting early")
+                        session.is_listening = True
+                        session.audio_buffer.clear()
+                        session.last_asr_text = ""
+                        session.audio_buffer.append(pcm)
+                        self._reset_eos(session)
+                except Exception:
+                    pass
             return
-        session.current_text = text
-        self._start_turn(session, text)
+        opus_data = msg["data"] if isinstance(msg["data"], bytes) else msg.get("data")
+        if not opus_data:
+            return
+        if isinstance(opus_data, str):
+            import base64
+            opus_data = base64.b64decode(opus_data)
+        try:
+            pcm = self._opus_decode(session, opus_data)
+            session.audio_buffer.append(pcm)
+            # Only reset EOS if this chunk contains actual speech
+            silent, rms = _is_silence(pcm)
+            if not silent:
+                self._reset_eos(session)
+            # Throttled log every 30 chunks
+            if len(session.audio_buffer) % 30 == 0:
+                logger.info(f"[WS] Audio #{len(session.audio_buffer)} chunks, "
+                           f"RMS={rms:.0f} silent={silent}, "
+                           f"total={sum(len(c) for c in session.audio_buffer)}B")
+        except Exception as e:
+            logger.error(f"[WS] Opus decode: {e}")
 
-    def _decode_opus(self, session: RobotSession, opus_data: bytes) -> bytes:
-        """Decode a single Opus packet to 16-bit PCM. Creates decoder on first call."""
-        if session.opus_decoder is None:
-            session.opus_decoder = opuslib.Decoder(16000, 1)
-        return session.opus_decoder.decode(opus_data, frame_size=960)
+    async def _handle_jpeg_frame(self, session: RobotSession, raw: bytes):
+        """Decode binary DataType::Jpeg frame from ESP32 and route to vision."""
+        import base64
+        # Binary format: [0x02][len:4 BE][jpeg payload]
+        if len(raw) < 5:
+            return
+        jpeg_data = raw[5:]
+        if not jpeg_data:
+            return
+        # Route to vision_frame handler using base64 wrapper
+        msg = {
+            "type": "vision_frame",
+            "data": base64.b64encode(jpeg_data).decode(),
+        }
+        await self._handle_vision_frame(session, msg)
 
-    def _reset_eos_timer(self, session: RobotSession):
-        """Reset the end-of-speech timer. When it fires, process buffered audio."""
+    async def _start_camera(self, session: RobotSession):
+        """Send StartCameraStream binary command to ESP32."""
+        # DataType::StartCameraStream = 0x05, no payload
+        packet = bytes([0x05, 0x00, 0x00, 0x00, 0x00])
+        try:
+            await session.websocket.send_bytes(packet)
+            logger.info("[WS] Camera stream started")
+        except Exception as e:
+            logger.error(f"[WS] Failed to start camera: {e}")
+
+    def _reset_eos(self, session: RobotSession):
+        """Start/reset end-of-speech timer. Fires 1.5s after last speech chunk."""
         if session.eos_task and not session.eos_task.done():
             session.eos_task.cancel()
         session.eos_task = asyncio.create_task(
-            self._eos_timeout_handler(session),
+            self._eos_handler(session),
             name=f"eos-{session.session_id}",
         )
 
-    async def _eos_timeout_handler(self, session: RobotSession):
-        """Wait for silence timeout, then process buffered audio as complete utterance."""
-        try:
-            await asyncio.sleep(session.eos_timeout)
-            if session.audio_buffer and session.is_listening:
-                chunk_count = len(session.audio_buffer)
-                combined = b"".join(session.audio_buffer)
-                session.audio_buffer.clear()
-                logger.info(f"[WS] End-of-speech: {len(combined)} bytes PCM from {chunk_count} chunks")
-                text = await asr_service.transcribe(combined)
-                if text:
-                    session.current_text = text
-                    logger.info(f"[WS] ASR result: {text[:60]}")
-                    self._start_turn(session, text)
-                else:
-                    logger.info("[WS] ASR: speech not recognized")
-                    await self._send_stackchan_text(session, "抱歉，我没听清")
-        except asyncio.CancelledError:
-            pass
+    # ── vision frame handling ──────────────────────────────────
 
-    async def _handle_vad_message(self, session: RobotSession, message: dict):
-        state = message.get("state", "unknown")
-        logger.info(f"[WS] VAD state: {state} from {session.session_id}")
-
-        if state == "start":
-            session.cancel_current_turn()
-            session.audio_buffer.clear()
-            session.is_listening = True
-            await self._send_message(session.websocket, {
-                "type": "interrupt",
-                "turn": session.turn_id,
-            })
-            logger.info(f"[WS] Barge-in: interrupt sent, new turn_id={session.turn_id}")
-
-            # Fire-and-forget LLM pre-warm while user is still speaking
-            # (reduces TTFT when ASR completes and LLM turn starts)
-            if self.hermes:
-                asyncio.create_task(self.hermes.ensure_warm())
-
-        elif state == "end":
-            session.is_listening = False
-            if session.audio_buffer:
-                # Transcribe buffered audio chunks as one combined clip
-                logger.info(f"[WS] Transcribing {len(session.audio_buffer)} buffered chunks")
-                combined = b"".join(session.audio_buffer)
-                text = await asr_service.transcribe(combined)
-                session.audio_buffer.clear()
-                if text:
-                    session.current_text = text
-                    self._start_turn(session, text)
-            elif session.current_text:
-                self._start_turn(session, session.current_text)
-
-        elif state == "speaking":
-            pass
-
-    async def _handle_vision_frame(self, session: RobotSession, message: dict):
-        """Process a JPEG frame from ESP32 camera (base64-encoded)."""
-        if not vision_service.enabled:
-            return
-
-        jpeg_b64 = message.get("data", "")
-        if not jpeg_b64:
-            return
-
-        jpeg_bytes = base64.b64decode(jpeg_b64)
-        results = await vision_service.process_frame(jpeg_bytes)
-
-        # Multi-user: merge all recognized persons into session
-        if results:
-            seen_names = set()
-            for det in results:
-                name = det.get("name", "unknown")
-                if name == "unknown":
-                    continue
-                seen_names.add(name)
-                if name in session.person_profiles:
-                    continue  # already tracked
-                profile = profile_store.get_profile(name)
-                session.person_profiles[name] = {
-                    "name": name,
-                    "relationship": profile.relationship if profile else "",
-                    "preferences": profile.preferences if profile else "",
-                }
-                await self._send_message(session.websocket, {
-                    "type": "person_detected",
-                    "name": name,
-                    "relationship": session.person_profiles[name].get("relationship", ""),
-                })
-                logger.info(f"[WS] Person '{name}' entered frame")
-
-            # Remove persons no longer in frame
-            departed = [
-                n for n in session.person_profiles
-                if n not in seen_names
-            ]
-            for name in departed:
-                logger.info(f"[WS] Person '{name}' left frame")
-                del session.person_profiles[name]
-
-            session.current_person = next(iter(session.person_profiles), None)
-        else:
-            # No faces at all
-            if session.person_profiles:
-                session.person_profiles.clear()
-                session.current_person = None
-                logger.info("[WS] All persons left frame")
-
-    async def _handle_hello(self, session: RobotSession, message: dict):
-        """Respond to XiaoZhi protocol handshake."""
-        proto_version = message.get("protocolVersion", "2024-11-05")
-        server_info = message.get("serverInfo", {})
-        device_name = server_info.get("name", "unknown")
-        device_version = server_info.get("version", "unknown")
-        logger.info(
-            f"[WS] XiaoZhi hello from {device_name} v{device_version} "
-            f"(protocol={proto_version})"
-        )
-        await self._send_message(session.websocket, {
-            "type": "hello",
-            "transport": "websocket",
-            "session_id": session.session_id,
-            "audio_params": {
-                "format": "opus",
-                "sample_rate": 16000,
-                "channels": 1,
-                "frame_duration": 60,
-            },
-        })
-
-    async def _handle_listen(self, session: RobotSession, message: dict):
-        """Acknowledge listen state from StackChan (wake-word listening mode)."""
-        state = message.get("state", "start")
-        logger.info(f"[WS] Listen state: {state} from {session.session_id}")
-
-        if state == "start":
-            session.is_listening = True
-            session.audio_buffer.clear()
-            session.cancel_current_turn()
-        elif state in ("end", "stop"):
-            session.is_listening = False
-            if session.audio_buffer:
-                combined = b"".join(session.audio_buffer)
-                session.audio_buffer.clear()
-                logger.info(f"[WS] Explicit end-of-speech: {len(combined)} bytes PCM")
-                text = await asr_service.transcribe(combined)
-                if text:
-                    session.current_text = text
-                    self._start_turn(session, text)
-            if session.eos_task and not session.eos_task.done():
-                session.eos_task.cancel()
-
-        await self._send_message(session.websocket, {
-            "type": "listen_ack",
-            "state": state,
-            "session_id": session.session_id,
-        })
-
-    async def _handle_ping(self, session: RobotSession, message: dict):
-        await self._send_message(session.websocket, {
-            "type": "pong",
-            "timestamp": message.get("timestamp"),
-        })
-
-    # ── turn management ───────────────────────────────────────
-
-    def _start_turn(self, session: RobotSession, text: str):
-        """Cancel any active turn and launch a new one"""
-        session.cancel_current_turn()
-        turn_id = session.turn_id
-
-        task = asyncio.create_task(
-            self._process_turn(session, text, turn_id),
-            name=f"turn-{turn_id}-{session.session_id}",
-        )
-        session.pending_task = task
-        metrics.turns_total += 1
-        logger.info(f"[WS] Turn {turn_id} started: {text[:60]}")
-
-    async def _thinking_heartbeat(self, session: RobotSession, turn_id: int):
-        """Send periodic status updates during long LLM waits.
-
-        Fires at 4s, 8s, 15s if first token hasn't arrived yet.
-        Cancelled by llm_reader when first token arrives.
+    async def _handle_vision_frame(self, session: RobotSession, msg: dict):
+        """Process JPEG frame/crop from ESP32: detect + recognize faces.
+        Also runs face_tracker to keep the camera centered on the speaker.
         """
+        import base64
+
+        data_b64 = msg.get("data", "")
+        if not data_b64:
+            return
         try:
-            await asyncio.sleep(4)
-            if turn_id == session.turn_id:
-                await self._send_message(session.websocket, {
-                    "type": "status", "message": "deep thinking",
-                    "action": "thinking", "turn": turn_id,
-                })
-            await asyncio.sleep(4)
-            if turn_id == session.turn_id:
-                await self._send_message(session.websocket, {
-                    "type": "status", "message": "still working",
-                    "action": "thinking", "turn": turn_id,
-                })
-            await asyncio.sleep(7)
-            if turn_id == session.turn_id:
-                await self._send_message(session.websocket, {
-                    "type": "status", "message": "almost ready",
-                    "action": "thinking", "turn": turn_id,
-                })
+            jpeg = base64.b64decode(data_b64)
+        except Exception:
+            return
+
+        is_face_crop = msg.get("face", False)
+
+        if is_face_crop:
+            import cv2
+            import numpy as np
+            arr = np.frombuffer(jpeg, dtype=np.uint8)
+            crop = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if crop is None:
+                return
+            profile = profile_store.recognize(crop)
+            bx, by, bw, bh = msg.get("bx", 0), msg.get("by", 0), msg.get("bw", 0), msg.get("bh", 0)
+            person_name = profile.name if profile else ""
+            self._apply_vision_result(session, profile, crop, (bx, by, bw, bh), person_name,
+                                      (320, 240))
+            return
+
+        # Full frame — server-side detect + recognize
+        fw = msg.get("width", 320)
+        fh = msg.get("height", 240)
+        results = await vision_service.process_frame(jpeg)
+        for r in results:
+            profile = r.get("profile")
+            bbox = r.get("bbox", (0, 0, 0, 0))
+            person_name = profile.name if profile else ""
+            self._apply_vision_result(session, profile, r.get("crop"), bbox, person_name,
+                                      (fw, fh))
+
+    def _apply_vision_result(self, session: RobotSession, profile, crop,
+                             bbox: tuple, person_name: str, frame_size: tuple):
+        """Update session state + run face tracker for camera centering."""
+        if profile is not None:
+            session.person_profiles[profile.name] = {
+                "name": profile.name,
+                "relationship": profile.relationship,
+                "preferences": profile.preferences,
+            }
+            if session.current_person != profile.name:
+                session.current_person = profile.name
+                session.unknown_face_pending = False
+                logger.info(f"[Vision] Recognized: {profile.name} ({profile.relationship})")
+        elif not session.current_person:
+            triggered = face_registry.on_unknown_face(crop, bbox)
+            if triggered:
+                session.unknown_face_pending = True
+                logger.info("[Vision] Unknown face flag set — LLM will be prompted")
+
+        # Face tracking: gently turn toward the speaker
+        cmd = face_tracker.update(
+            bbox, frame_size,
+            person_name=person_name,
+            current_person=session.current_person or "",
+        )
+        if cmd:
+            asyncio.create_task(self._send_mcp_async(session, "self.robot.set_head_angles", {
+                "yaw": cmd[0], "pitch": cmd[1], "speed": cmd[2],
+            }))
+
+    async def _eos_handler(self, session: RobotSession):
+        """After 1.5s of silence: run ASR, POST result to Hermes webhook."""
+        try:
+            await asyncio.sleep(1.5)
+            if session.is_listening and session.audio_buffer:
+                pcm_data = b"".join(session.audio_buffer)
+                logger.info(f"[WS] EOS — processing {len(pcm_data)}B from {len(session.audio_buffer)} chunks")
+                text = await asr_service.transcribe(pcm_data)
+                if text.strip():
+                    logger.info(f"[WS] ASR: {text}")
+                    session.last_asr_text = text
+                    # Send STT display to ESP32
+                    await self._send_json(session.websocket, {
+                        "type": "stt", "text": text, "session_id": session.session_id,
+                    })
+                    # POST to Hermes webhook — Hermes Agent handles the rest
+                    asyncio.create_task(self._post_webhook(session, text))
+                else:
+                    logger.info("[WS] ASR: no speech detected")
+                session.is_listening = False
         except asyncio.CancelledError:
             pass
 
-    def _build_system_prompt(self, session: RobotSession) -> str:
-        """Build system prompt with multi-user profile injection."""
-        base = config.robot.system_prompt
-        if not session.person_profiles:
-            return base
+    async def _post_webhook(self, session: RobotSession, text: str):
+        """POST ASR text to Hermes webhook. Hermes Agent drives the response."""
+        import httpx
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                await client.post(
+                    "http://127.0.0.1:8644/webhooks/stackchan",
+                    json={
+                        "text": text,
+                        "session_id": session.session_id,
+                        "person": session.current_person or "",
+                    },
+                    headers={"X-Webhook-Signature": "INSECURE_NO_AUTH"},
+                )
+            logger.info(f"[Webhook] Sent: {text[:40]}")
+        except Exception as e:
+            logger.error(f"[Webhook] Failed: {e}")
 
-        lines = [base, "\n当前在场用户信息："]
-        for name, p in session.person_profiles.items():
-            rel = p.get("relationship", "")
-            pref = p.get("preferences", "")
-            info = f"- {name}"
-            if rel:
-                info += f"（{rel}）"
-            if pref:
-                info += f"，偏好：{pref}"
-            lines.append(info)
+    # ── TTS streaming ──────────────────────────────────────────
 
-        lines.append("根据当前用户身份调整回应。")
-        return "\n".join(lines)
+    async def _tts_and_send(self, session: RobotSession, text: str):
+        """TTS → scipy resample → Opus encode → stream to device.
 
-    async def _process_turn(self, session: RobotSession, text: str, turn_id: int):
-        """Simplified pipeline: LLM stream → collect response → send via StackChan TextMessage."""
-        if not self.hermes:
-            logger.error("[WS] Hermes client not available")
-            await self._send_stackchan_text(session, "抱歉，AI 服务未连接")
+        Reuses one Opus encoder for all sentences to avoid state-reset artifacts.
+        """
+        import re
+        sentences = _split_sentences(text)
+
+        session._tts_stop = asyncio.Event()  # fresh cancel event for this turn
+
+        try:
+            await self._send_json(session.websocket, {
+                "type": "tts", "state": "start", "session_id": session.session_id,
+            })
+            self._stop_rainbow(session)
+            self._set_led(session, 0, 0, 168)  # Blue = speaking
+        except Exception:
             return
 
+        # Single Opus encoder — reused across sentences to avoid reset artifacts
+        encoder = opuslib.Encoder(OPUS_SR, OPUS_CHANNELS, 'voip')
+        encoder.bitrate = 48000
+        encoder.complexity = 10
+
+        frame_count = 0
         try:
-            logger.info(f"[WS] Turn {turn_id} processing: {text[:60]}")
+            for i, sentence in enumerate(sentences):
+                if session._tts_stop and session._tts_stop.is_set():
+                    logger.info("[WS] TTS stopped mid-stream")
+                    return
 
-            # Collect full LLM response
-            buffer = ""
-            try:
-                async for token in self.hermes.chat_stream(
-                    message=text,
-                    session_id=session.session_id,
-                    system_prompt=self._build_system_prompt(session),
-                ):
-                    if turn_id != session.turn_id:
-                        logger.info(f"[WS] Turn {turn_id} preempted")
-                        return
-                    clean = sanitize_for_tts(token)
-                    if clean:
-                        buffer += clean
-            except Exception as e:
-                logger.error(f"[WS] LLM stream error: {e}")
-
-            if turn_id != session.turn_id:
-                return
-
-            response = buffer.strip()
-            if response:
-                logger.info(f"[WS] Turn {turn_id} response: {response[:60]}")
-                await self._send_stackchan_text(session, response)
-            else:
-                await self._send_stackchan_text(session, "嗯？")
-
+                frame_count += await self._tts_send_one(session, sentence, encoder)
         except asyncio.CancelledError:
-            logger.info(f"[WS] Turn {turn_id} cancelled")
+            pass
         except Exception as e:
-            logger.error(f"[WS] Turn {turn_id} error: {e}")
-            if turn_id == session.turn_id:
-                await self._send_stackchan_text(session, f"出错了：{e}")
-
-    # ── utilities ─────────────────────────────────────────────
-
-    async def _send_message(self, websocket, message: dict):
-        try:
-            await websocket.send_text(json.dumps(message))
-        except Exception as e:
-            logger.error(f"[WS] Send error: {e}")
-
-    async def _send_stackchan_binary(self, websocket, data_type: int, payload: bytes = b""):
-        """Send a StackChan binary protocol packet: [1B type][4B big-endian len][N B payload]"""
-        header = bytes([data_type]) + struct.pack(">I", len(payload))
-        try:
-            await websocket.send_bytes(header + payload)
-        except Exception as e:
-            logger.error(f"[WS] StackChan send error: {e}")
-
-    async def _send_stackchan_text(self, session: RobotSession, content: str, name: str = "叁叁"):
-        """Send a text response via StackChan TextMessage (0x07)."""
-        payload = json.dumps({"name": name, "content": content}, ensure_ascii=False).encode('utf-8')
-        await self._send_stackchan_binary(session.websocket, 0x07, payload)
-        logger.info(f"[WS] StackChan text sent: {content[:40]}")
-
-    async def broadcast(self, message: dict):
-        for session in self.sessions.values():
+            logger.error(f"[WS] TTS stream error: {e}")
+        finally:
+            self._set_led(session, 0, 0, 0)
             try:
-                await self._send_message(session.websocket, message)
+                await self._send_json(session.websocket, {
+                    "type": "tts", "state": "stop", "session_id": session.session_id,
+                })
             except Exception:
-                logger.warning(f"[WS] Broadcast failed for session {session.session_id}")
+                pass
+            logger.info(f"[WS] TTS sent: {frame_count} Opus frames, {len(sentences)} sentences")
+
+    async def _tts_send_one(self, session: RobotSession, text: str, encoder) -> int:
+        """Synthesize one sentence and stream Opus frames. Returns frame count."""
+        if not text.strip():
+            return 0
+
+        pcm_bytes = await tts_service.synthesize_pcm(text)
+        if not pcm_bytes:
+            return 0
+
+        count = 0
+        t0 = time.monotonic()
+        pos = 0
+        while pos + FRAME_BYTES <= len(pcm_bytes):
+            if session._tts_stop and session._tts_stop.is_set():
+                return count
+            frame = pcm_bytes[pos:pos + FRAME_BYTES]
+            pos += FRAME_BYTES
+            opus = encoder.encode(frame, FRAME_SAMPLES)
+            try:
+                await session.websocket.send_bytes(opus)
+                count += 1
+            except Exception:
+                return count
+            # Frame budget pacing: each frame is 60ms. Sleep only the
+            # remaining budget so actual interval stays ≤60ms. Prevents
+            # both ESP32 buffer underrun (too slow) and overflow (too fast).
+            elapsed = time.monotonic() - t0
+            target = count * (OPUS_FRAME_MS / 1000.0)
+            slack = target - elapsed
+            if slack > 0.002:  # Only sleep if >2ms remaining
+                await asyncio.sleep(slack)
+
+        # Drop partial final frame (<60ms, inaudible)
+        return count
+
+    async def _handle_mcp_response(self, session: RobotSession, msg: dict):
+        """Resolve MCP future when ESP32 sends back a response."""
+        payload = msg.get("payload", {})
+        mcp_id = payload.get("id")
+        if mcp_id and hasattr(session, '_mcp_futures') and mcp_id in session._mcp_futures:
+            result = payload.get("result", payload.get("error", "ok"))
+            session._mcp_futures[mcp_id].set_result(json.dumps(result, ensure_ascii=False))
+            session._mcp_futures.pop(mcp_id, None)
+            logger.info(f"[WS] MCP response id={mcp_id}")
+
+    async def _send_mcp_async(self, session: RobotSession, name: str, args: dict):
+        """Fire-and-forget MCP to ESP32 — used for face tracking (no response needed)."""
+        mcp_id = int(time.time() * 1000) % 100000
+        payload = {
+            "jsonrpc": "2.0",
+            "id": mcp_id,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": args},
+        }
+        try:
+            await session.websocket.send_text(json.dumps({
+                "type": "mcp",
+                "session_id": session.session_id,
+                "payload": payload,
+            }, ensure_ascii=False))
+        except Exception:
+            pass
+
+    async def _mcp_call(self, session: RobotSession, name: str, args: dict) -> str:
+        """Send MCP JSON-RPC to ESP32 and wait for response."""
+        # Pause face tracker when LLM deliberately moves the head
+        if name == "self.robot.set_head_angles":
+            face_tracker.pause(4.0)
+
+        mcp_id = int(time.time() * 1000) % 100000
+        payload = {
+            "jsonrpc": "2.0",
+            "id": mcp_id,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": args},
+        }
+        msg = {
+            "type": "mcp",
+            "session_id": session.session_id,
+            "payload": payload,
+        }
+
+        # Create an event to wait for the response
+        future: asyncio.Future = asyncio.get_event_loop().create_future()
+        if not hasattr(session, '_mcp_futures'):
+            session._mcp_futures = {}
+        session._mcp_futures[mcp_id] = future
+
+        await session.websocket.send_text(json.dumps(msg, ensure_ascii=False))
+        logger.info(f"[WS] MCP sent: {name}({args}) id={mcp_id}")
+
+        try:
+            result = await asyncio.wait_for(future, timeout=10.0)
+            return result
+        except asyncio.TimeoutError:
+            session._mcp_futures.pop(mcp_id, None)
+            return json.dumps({"error": "timeout"})
+
+    # ── LED status indicators ─────────────────────────────────
+
+    _RAINBOW = [
+        (168, 0, 0), (168, 84, 0), (168, 168, 0),
+        (0, 168, 0), (0, 168, 168), (0, 0, 168), (84, 0, 168),
+    ]
+
+    def _set_led(self, session: RobotSession, r: int, g: int, b: int):
+        """Fire-and-forget LED color."""
+        asyncio.create_task(self._send_mcp_async(
+            session, "self.robot.set_led_color",
+            {"red": r, "green": g, "blue": b},
+        ))
+
+    async def _led_off_after(self, session: RobotSession, delay: float):
+        """Turn LED off after delay (unless overridden by later LED commands)."""
+        await asyncio.sleep(delay)
+        self._set_led(session, 0, 0, 0)
+
+    def _start_rainbow(self, session: RobotSession):
+        """Start color-chasing LED animation (cancels any previous)."""
+        self._stop_rainbow(session)
+        session._led_task = asyncio.create_task(
+            self._rainbow_loop(session),
+            name=f"led-{session.session_id}",
+        )
+
+    async def _rainbow_loop(self, session: RobotSession):
+        """Background: cycle LED through rainbow colors."""
+        i = 0
+        try:
+            while True:
+                r, g, b = self._RAINBOW[i % len(self._RAINBOW)]
+                try:
+                    await self._send_mcp_async(
+                        session, "self.robot.set_led_color",
+                        {"red": r, "green": g, "blue": b},
+                    )
+                except Exception:
+                    pass
+                i += 1
+                await asyncio.sleep(0.25)
+        except asyncio.CancelledError:
+            pass
+
+    def _stop_rainbow(self, session: RobotSession):
+        """Stop rainbow animation."""
+        if session._led_task and not session._led_task.done():
+            session._led_task.cancel()
+            session._led_task = None
+
+    # ── utilities ──────────────────────────────────────────────
+
+    def _opus_decode(self, session: RobotSession, data: bytes) -> bytes:
+        if session.opus_decoder is None:
+            session.opus_decoder = opuslib.Decoder(OPUS_SR, OPUS_CHANNELS)
+        return session.opus_decoder.decode(data, FRAME_SAMPLES)
+
+    async def _send_json(self, ws, obj: dict):
+        try:
+            await ws.send_text(json.dumps(obj, ensure_ascii=False))
+        except Exception as e:
+            logger.error(f"[WS] send error: {e}")
+
+    def _save_tts_debug(self, frames: list[bytes]):
+        """Decode Opus frames back to WAV and save for quality verification."""
+        try:
+            dec = opuslib.Decoder(OPUS_SR, OPUS_CHANNELS)
+            pcm = b""
+            for f in frames:
+                pcm += dec.decode(f, FRAME_SAMPLES)
+            with wave.open("/tmp/tts_debug.wav", "wb") as w:
+                w.setnchannels(1); w.setsampwidth(2); w.setframerate(OPUS_SR)
+                w.writeframes(pcm)
+            logger.info(f"[WS] Debug WAV saved: {len(pcm)}B PCM")
+        except Exception as e:
+            logger.error(f"[WS] Debug save error: {e}")
+
+    async def process_on_disconnect(self, session: RobotSession):
+        """Fallback: cleanup on device disconnect."""
+        if session.is_listening and session.audio_buffer:
+            logger.info("[WS] Disconnect during listen — discarding buffered audio")
+        # Cancel any in-flight TTS tasks
+        session.cancel_current_turn()
+
+
+# ── helpers ────────────────────────────────────────────────────
+
+def _split_sentences(text: str) -> list[str]:
+    """Split Chinese text into sentences by punctuation, keeping separator."""
+    import re
+    parts = re.split(r'(?<=[。！？!?\n])', text)
+    result = [p.strip() for p in parts if p.strip()]
+    return result if result else [text]
+
+
+def _is_silence(pcm: bytes, threshold: int = 250) -> tuple[bool, float]:
+    """Check if 16-bit mono PCM is silence. Returns (is_silent, rms)."""
+    import array
+    if len(pcm) < 2:
+        return True, 0.0
+    samples = array.array('h', pcm)
+    if len(samples) == 0:
+        return True, 0.0
+    rms = (sum(s * s for s in samples) / len(samples)) ** 0.5
+    return rms < threshold, rms
 
 
 ws_handler = RobotWebSocketHandler()
