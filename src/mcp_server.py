@@ -111,18 +111,10 @@ class StackChanTools:
     # ── Listen: ASR ──
 
     async def tool_listen(self, timeout: float = 10.0) -> dict:
-        """
-        Listen to the user and transcribe speech to text.
-
-        1. Sends listen state=start to ESP32
-        2. Buffers incoming Opus audio
-        3. Detects EOS (silence)
-        4. Runs ASR on buffered audio
-        5. Returns transcribed text
-        """
+        """Listen to the user and transcribe speech to text."""
         await self.wait_ready()
         if not self._ws_handler or not self._ws_handler.sessions:
-            return {"error": "No ESP32 device connected"}
+            return await self._bridge_api("listen")
 
         # Get the active session
         session = self._get_active_session()
@@ -664,31 +656,18 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
     return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
 
 
-# ── Main: run both WebSocket server and MCP stdio server ──
+# ── Main: MCP stdio server (headless — HTTP fallback to Bridge) ──
 
 async def main():
-    """Start MCP stdio server with optional built-in WebSocket server for ESP32."""
+    """Start MCP stdio server. Headless mode — tools use HTTP fallback to Bridge.
 
-    # Try to start FastAPI + WebSocket server in background.
-    # If port is occupied (old Bridge running), MCP tools just return "no device".
-    try:
-        ws_task = asyncio.create_task(_start_websocket_server())
-        await asyncio.sleep(0.5)
-    except Exception as e:
-        logger.warning(f"[MCP] WebSocket server not started (old Bridge may be running): {e}")
+    Does NOT load ASR/TTS models or start FastAPI. The main Bridge process
+    (:8081) handles all hardware. This process just exposes tools via stdio
+    for Hermes Agent; each tool call proxies to Bridge via HTTP internal API.
+    """
+    logger.info("[MCP] MCP stdio server starting (headless, HTTP fallback to :8081)")
 
-    # Try to set ws_handler reference
-    try:
-        from .websocket_handler import ws_handler as wsh
-        tools.set_ws_handler(wsh)
-        # Hook agent driver into Bridge's ASR callback (no polling)
-        from .agent_driver import agent_driver
-        agent_driver.set_ws_handler(wsh)
-        logger.info("[MCP] Agent driver hooked to Bridge ASR")
-    except Exception as e:
-        logger.info(f"[MCP] Running in headless mode (no ESP32 connection): {e}")
-
-    # Start MCP stdio server
+    # Start MCP stdio server — no FastAPI, no models, instant startup
     async with stdio_server() as (read_stream, write_stream):
         await mcp_server.run(
             read_stream,

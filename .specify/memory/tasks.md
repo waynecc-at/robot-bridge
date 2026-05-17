@@ -121,6 +121,59 @@
 
 ---
 
+## Phase 3.6: Webhook Architecture & Firmware Tuning ✅ (2026-05-17)
+
+**Goal**: Migrate from Agent Driver to webhook-driven architecture; fix wake word, idle timeout.
+
+### Webhook Architecture
+
+- [x] T067 Replace Agent Driver with Hermes webhook (:8644) — ASR text POST to /webhooks/stackchan
+- [x] T068 Delete agent_driver.py (188 lines of decision logic removed)
+- [x] T069 Add `/internal/*` API endpoints (speak, led, look, emote, listen, idle) for MCP HTTP fallback
+- [x] T070 MCP tools HTTP fallback — tools call Bridge :8081/internal/* when ws_handler unavailable
+- [x] T071 Register webhook subscription via `hermes webhook subscribe stackchan`
+- [x] T072 Simplify webhook prompt from 7-step script to personality-driven
+- [x] T073 Fix MCP server PYTHONPATH in Hermes config (CWD mismatch)
+- [x] T074 Remove wake word webhook POST — local green LED only, no double trigger
+- [x] T075 Remove `_on_asr_callback` and `_on_wake_callback` from websocket_handler
+- [x] T076 Webhook delivers to `log`; response goes through `stackchan_speak()` MCP tool → TTS
+
+### Firmware
+
+- [x] T077 Wake word "hai san san" → "叁叁" (sdkconfig), threshold 12
+- [x] T078 Idle timeout: 180s no speech → exit dialogue → Idle → wait for wake word
+- [x] T079 Audio power timeout: 15s (firmware default, hardware power save)
+- [x] T080 CONFIG_SEND_WAKE_WORD_DATA=n (wake word triggers OpenAudioChannel, not detect event)
+- [x] T081 Wake guard: ignore wake word during Speaking/Listening states
+- [x] T082 Camera stream auto-start (Bridge sends StartCameraStream on hello)
+- [x] T083 Idle motion interval: 55-65s → 28-32s
+- [x] T084 OTA endpoint integrated into Bridge (:8081/ota), old server (:8884) removed
+- [x] T085 OTA URL updated in sdkconfig to :8081/ota
+
+### TTS Audio Pipeline
+
+- [x] T086 ffmpeg soxr resampling (float32 PCM direct, no WAV roundtrip)
+- [x] T087 Single Opus encoder per utterance (voip profile, 48kbps)
+- [x] T088 Frame budget pacing (max 60ms/frame, no buffer underrun)
+- [x] T089 Drop partial final Opus frame (no zero-padding pop)
+- [x] T090 TTS lexicon fix: add shei2 for 谁
+
+### LED State Machine
+
+- [x] T091 Green LED on listen start
+- [x] T092 Rainbow LED during thinking (Hermes Agent via MCP tool)
+- [x] T093 Blue LED during speaking (auto in _tts_and_send)
+- [x] T094 LED off on listen stop / idle
+
+### Success Criteria Update
+
+- **SC-012**: Voice conversation latency <5s (webhook + MCP + TTS)
+- **SC-013**: Wake word "叁叁" triggers OpenAudioChannel → auto-listen
+- **SC-014**: 180s idle timeout → exit dialogue → LED off → wake word required
+- **SC-015**: MCP tools fully operational via stdio (Hermes) + HTTP fallback (Bridge)
+
+---
+
 ## Phase 4: Face Registration Upgrade
 
 **Goal**: Face registration fully driven by Agent Driver via Hermes LLM.
@@ -178,8 +231,9 @@
 | 2. Hermes Loop | 10 | ✅ | +400 |
 | 3. Strip Bridge | 8 | ✅ | -800 (net) |
 | 3.5. Integration & Audio | 22 | ✅ | -200 (audit cleanup) |
+| 3.6. Webhook & Firmware | 24 | ✅ | -188 (Agent Driver deleted) |
 | 4. Face Register | 4 | ⬜ | +200 |
 | 5. Proactive | 9 | ⬜ | +250 |
-| 6. Firmware | 3 | ⬜ | Minimal |
-| 7. Function Calling | 4 | ⬜ | +300 |
-| **Total** | **74** | **54✅ 20⏳** | **Bridge: -600 net** |
+| 6. Firmware Tuning | 0 | ✅ | (merged into 3.6) |
+| 7. Function Calling | 0 | ✅ | (webhook + MCP natively handles this) |
+| **Total** | **91** | **78✅ 13⏳** | **Bridge: -788 net** |

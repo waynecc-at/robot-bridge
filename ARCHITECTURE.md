@@ -73,7 +73,7 @@ LED 状态指示                头部转向决策
 ### 目录结构
 
 ```
-/home/wayne/robot-bridge/          # robot-bridge 主项目
+/opt/robot-bridge/          # robot-bridge 主项目
   src/
     api.py                          # FastAPI HTTP/WS 端点
     websocket_handler.py            # XiaoZhi 协议 + 人脸信号 + LED + MCP 转发
@@ -106,17 +106,17 @@ LED 状态指示                头部转向决策
 
 ```bash
 # OTA
-nohup /home/wayne/robot-bridge/.venv/bin/python /tmp/ota_server.py >> /tmp/local_services.log 2>&1 &
+nohup /opt/robot-bridge/.venv/bin/python /tmp/ota_server.py >> /tmp/local_services.log 2>&1 &
 # MQTT
-nohup /home/wayne/robot-bridge/.venv/bin/python /tmp/mqtt_only.py >> /tmp/local_services.log 2>&1 &
+nohup /opt/robot-bridge/.venv/bin/python /tmp/mqtt_only.py >> /tmp/local_services.log 2>&1 &
 # Bridge (包含 ASR + TTS + MCP + Vision)
-cd /home/wayne/robot-bridge && nohup .venv/bin/python -m src.main >> logs/bridge.log 2>&1 &
+cd /opt/robot-bridge && nohup .venv/bin/python -m src.main >> logs/bridge.log 2>&1 &
 ```
 
 ### 测试命令
 
 ```bash
-cd /home/wayne/robot-bridge
+cd /opt/robot-bridge
 .venv/bin/python tests/test_bridge_v2.py          # 全部11项
 .venv/bin/python tests/test_bridge_v2.py --test chat  # 单项
 ```
@@ -124,7 +124,7 @@ cd /home/wayne/robot-bridge
 ### 烧录命令
 
 ```bash
-sg dialout -c "/home/wayne/robot-bridge/.venv/bin/esptool --chip esp32s3 \
+sg dialout -c "/opt/robot-bridge/.venv/bin/esptool --chip esp32s3 \
   -b 921600 --before default-reset --after hard-reset write-flash \
   --flash-mode dio --flash-size 16MB --flash-freq 80m \
   0x0 /tmp/StackChan/firmware/build/bootloader/bootloader.bin \

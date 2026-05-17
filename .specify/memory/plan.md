@@ -6,9 +6,20 @@
 
 ## Summary
 
-StackChan 从"Bridge 调 Hermes API"的胖中间件架构, 重构为"Hermes 通过 MCP + Gateway API 控制"的薄层架构。
-Bridge 降级为纯 MCP 工具服务器 + 音频管线。Agent Driver 通过 Hermes Gateway API 驱动对话。
-6 个阶段的渐进式改造, 每阶段独立可测。Phase 1-3 已完成。
+StackChan 从"Bridge 调 Hermes API"的胖中间件架构，重构为 webhook 驱动的薄层架构。
+
+**最终架构**：
+```
+ESP32 → Bridge :8081 (ASR/TTS/Opus/11 MCP 工具)
+           │ ASR → POST :8644/webhooks/stackchan
+           ▼
+  Hermes Agent (SOUL.md + Skills + Memory)
+           │ stackchan_speak/emote/look/led
+           ▼
+  MCP Server → HTTP :8081/internal/* → Bridge → ESP32
+```
+
+Bridge 降级为纯执行层（零决策逻辑），Agent Driver 已删除。Hermes Agent 通过 MCP 工具控制机器人全部动作。
 
 ## Current Architecture
 

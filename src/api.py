@@ -316,6 +316,20 @@ async def internal_emote(req: InternalEmoteReq):
     })
     return {"status": "ok"}
 
+@app.post("/internal/listen")
+async def internal_listen():
+    from .websocket_handler import ws_handler
+    session = _get_active_ws_session(ws_handler)
+    if not session: return {"error": "No ESP32 connected"}
+    session.is_listening = True
+    session.audio_buffer.clear()
+    session.last_asr_text = ""
+    await ws_handler._send_json(session.websocket, {
+        "type": "listen", "state": "start",
+        "session_id": session.session_id,
+    })
+    return {"status": "ok"}
+
 @app.post("/internal/idle")
 async def internal_idle():
     from .websocket_handler import ws_handler
@@ -356,8 +370,7 @@ async def websocket_endpoint(websocket: WebSocket):
     mcp_tools.set_ws_handler(ws_handler)
 
 
-    # Hermes webhook handles ASR → LLM → TTS.
-    # Agent Driver is deleted — see websocket_handler._post_webhook().
+    # ASR → Hermes webhook (:8644). Agent Driver is deleted.
 
     # Use Device-Id header (ESP32 MAC) as stable identity for cross-session pending responses
     device_id = websocket.headers.get("device-id", "") or str(uuid.uuid4())[:12]

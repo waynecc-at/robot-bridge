@@ -86,7 +86,6 @@ class RobotWebSocketHandler:
         self.sessions: dict[str, RobotSession] = {}
         # pending response carried across reconnects (keyed by device MAC)
         self._pending: dict[str, str] = {}
-        # Webhook URL for Hermes Agent (replaces Agent Driver callbacks)
         self._webhook_url = "http://127.0.0.1:8644/webhooks/stackchan"
 
     async def cleanup_stale_sessions(self, ttl: float = 600):
@@ -215,8 +214,7 @@ class RobotWebSocketHandler:
             self._set_led(session, 0, 168, 0)
             # Schedule off (rainbow will override if speech follows)
             asyncio.create_task(self._led_off_after(session, 1.8))
-            # Notify Hermes webhook of wake word
-            asyncio.create_task(self._post_webhook(session, "叁叁"))
+            # Wake word handled locally — green LED only, no webhook
 
     async def _handle_audio(self, session: RobotSession, msg: dict):
         """Raw Opus audio in binary frames — decode, buffer all.
@@ -409,7 +407,7 @@ class RobotWebSocketHandler:
                     await self._send_json(session.websocket, {
                         "type": "stt", "text": text, "session_id": session.session_id,
                     })
-                    # POST to Hermes webhook — Hermes Agent handles the rest
+                    # POST to Hermes webhook — Agent handles everything via MCP tools
                     asyncio.create_task(self._post_webhook(session, text))
                 else:
                     logger.info("[WS] ASR: no speech detected")

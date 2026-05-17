@@ -165,10 +165,10 @@ model:
   default: deepseek/deepseek-v4-flash
   provider: deepseek
 terminal:
-  cwd: /home/wayne/robot-bridge
+  cwd: /opt/robot-bridge
 mcp_servers:
   stackchan:
-    command: "/home/wayne/robot-bridge/.venv/bin/python"
+    command: "/opt/robot-bridge/.venv/bin/python"
     args: ["-m", "src.mcp_server"]
     timeout: 30
 ```
