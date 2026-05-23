@@ -340,6 +340,65 @@ async def internal_idle():
     ws_handler._set_led(session, 0, 0, 0)
     return {"status": "ok"}
 
+@app.post("/internal/see")
+async def internal_see():
+    from .websocket_handler import ws_handler
+    import base64
+    session = _get_active_ws_session(ws_handler)
+    if not session: return {"error": "No ESP32 connected"}
+    # Try cached stream frame first
+    if session.last_jpeg:
+        return {"jpeg_base64": base64.b64encode(session.last_jpeg).decode(), "timestamp": time.time()}
+    # Fallback: force one-shot photo via MCP
+    try:
+        result = await asyncio.wait_for(
+            ws_handler._mcp_call(session, "self.camera.take_photo", {"question": "看看"}),
+            timeout=10.0,
+        )
+        return {"jpeg_base64": result, "timestamp": time.time(), "note": "one-shot"}
+    except asyncio.TimeoutError:
+        return {"error": "camera timeout"}
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.post("/internal/face")
+async def internal_face():
+    from .websocket_handler import ws_handler
+    session = _get_active_ws_session(ws_handler)
+    if not session: return {"error": "No ESP32 connected"}
+    faces = []
+    person = session.current_person
+    if person and person in session.person_profiles:
+        faces.append({"name": person, "relationship": session.person_profiles[person].get("relationship", "")})
+    elif person:
+        faces.append({"name": person})
+    return {"faces": faces, "current_person": person, "timestamp": time.time()}
+
+class FaceRegisterReq(PydanticBase):
+    name: str
+    relationship: str = ""
+
+@app.post("/internal/face_register")
+async def internal_face_register(req: FaceRegisterReq):
+    from .websocket_handler import ws_handler
+    from .face_registry import face_registry as fr
+    from .profile_store import profile_store
+    session = _get_active_ws_session(ws_handler)
+    if not session: return {"error": "No ESP32 connected"}
+    crops = fr.get_crops()
+    extra = getattr(session, 'face_crops', [])
+    all_crops = list(crops) + list(extra)
+    if not all_crops:
+        return {"error": "no face crops available"}
+    profile = profile_store.register_person(
+        name=req.name, face_frames=all_crops[:8], relationship=req.relationship,
+    )
+    fr.clear()
+    if hasattr(session, 'face_crops'):
+        session.face_crops = []
+    session.unknown_face_pending = False
+    return {"success": True, "name": req.name} if profile else {"error": "registration failed"}
+
 def _get_active_ws_session(ws_handler):
     if not ws_handler.sessions: return None
     sessions = sorted(ws_handler.sessions.values(),
@@ -372,9 +431,9 @@ async def websocket_endpoint(websocket: WebSocket):
 
     # ASR → Hermes webhook (:8644). Agent Driver is deleted.
 
-    # Use Device-Id header (ESP32 MAC) as stable identity for cross-session pending responses
+    # Stable session_id per device — survives reconnects so Hermes agent cache hits
     device_id = websocket.headers.get("device-id", "") or str(uuid.uuid4())[:12]
-    session_id = str(uuid.uuid4())[:8]
+    session_id = f"stackchan-{device_id[:8]}" if device_id else str(uuid.uuid4())[:8]
     session = RobotSession(websocket=websocket, session_id=session_id, device_id=device_id)
     logger.info(f"[WS] Device {device_id} session {session_id}")
     ws_handler.sessions[session_id] = session
@@ -416,5 +475,47 @@ async def websocket_endpoint(websocket: WebSocket):
         ws_handler.sessions.pop(session_id, None)
 
 
+
+@app.websocket("/stackChan/ws")
+async def avatar_ws_endpoint(websocket: WebSocket):
+    """WS Avatar protocol — binary DataType camera/video stream from ESP32."""
+    from .websocket_handler import ws_handler, RobotSession
+
+    await websocket.accept()
+    logger.info("[Avatar] WS Avatar client connected")
+
+    device_id = websocket.headers.get("device-id", "") or str(uuid.uuid4())[:12]
+    session_id = "avatar-" + str(uuid.uuid4())[:8]
+    session = RobotSession(websocket=websocket, session_id=session_id, device_id=device_id)
+    ws_handler.sessions[session_id] = session
+
+    # Enable camera streaming immediately
+    await ws_handler._start_camera(session)
+
+    try:
+        while True:
+            try:
+                msg = await asyncio.wait_for(websocket.receive(), timeout=30)
+            except asyncio.TimeoutError:
+                continue
+
+            if "bytes" in msg:
+                raw = msg["bytes"]
+                # Binary DataType protocol: [Type(1)] [Length(4 BE)] [Payload]
+                if len(raw) >= 5 and raw[0] == 0x02:  # Jpeg
+                    await ws_handler._handle_jpeg_frame(session, raw)
+                elif len(raw) >= 5:
+                    logger.debug(f"[Avatar] Binary type=0x{raw[0]:02x} len={len(raw)}")
+            elif "text" in msg:
+                logger.debug(f"[Avatar] Text: {msg['text'][:80]}")
+            elif msg.get("type") == "websocket.disconnect":
+                break
+
+    except WebSocketDisconnect:
+        logger.info("[Avatar] WS Avatar client disconnected")
+    except Exception as e:
+        logger.opt(exception=True).error(f"[Avatar] Error: {e}")
+    finally:
+        ws_handler.sessions.pop(session_id, None)
 
     # RobotSession is imported from websocket_handler (single source of truth)
