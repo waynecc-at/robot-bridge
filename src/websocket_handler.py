@@ -108,10 +108,18 @@ class RobotWebSocketHandler:
                 if len(raw) >= 5 and raw[0] == 0x02:
                     await self._handle_jpeg_frame(session, raw)
                     return
+                # Check for binary Opus audio frame (0x01 + 4-byte BE length + payload)
+                if len(raw) >= 5 and raw[0] == 0x01:
+                    # Strip 5-byte header: [type(1)][len(4)]
+                    payload_len = int.from_bytes(raw[1:5], 'big')
+                    opus_payload = raw[5:5 + payload_len] if payload_len > 0 else raw[5:]
+                    msg = {"type": "audio", "data": opus_payload, "format": "opus"}
                 # Log non-audio binary frames for camera debug
-                if len(raw) >= 5 and raw[0] not in (0x01, 0x02):
+                elif len(raw) >= 5:
                     logger.info(f"[WS] Binary type=0x{raw[0]:02x} len={len(raw)}")
-                msg = {"type": "audio", "data": raw, "format": "opus"}
+                    msg = {"type": "audio", "data": raw, "format": "opus"}
+                else:
+                    msg = {"type": "audio", "data": raw, "format": "opus"}
             else:
                 msg = json.loads(raw)
 
