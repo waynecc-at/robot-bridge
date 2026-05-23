@@ -63,3 +63,4 @@ myapp-channel-0.1.0/node_modules/
 
 # Robot Bridge specific logs
 bridge.log*
+!src/libwebrtcvad.so

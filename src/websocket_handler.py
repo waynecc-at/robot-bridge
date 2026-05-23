@@ -64,8 +64,10 @@ class RobotSession:
     person_profiles: dict[str, dict] = field(default_factory=dict)
     unknown_face_pending: bool = False    # set when face_registry signals a new person
     last_conversation: str = ""           # user+assistant text from latest turn
+    last_jpeg: Optional[bytes] = None     # latest full-frame JPEG from camera stream
     _led_task: Optional[asyncio.Task] = None
     _tts_stop: Optional[asyncio.Event] = None  # set to cancel in-progress TTS stream
+    _webhook_pending: bool = False  # True while Hermes is processing a turn
 
     # Idle mode — when True, auto-listen is suppressed (user said goodbye)
     idle_mode: bool = False
@@ -106,6 +108,9 @@ class RobotWebSocketHandler:
                 if len(raw) >= 5 and raw[0] == 0x02:
                     await self._handle_jpeg_frame(session, raw)
                     return
+                # Log non-audio binary frames for camera debug
+                if len(raw) >= 5 and raw[0] not in (0x01, 0x02):
+                    logger.info(f"[WS] Binary type=0x{raw[0]:02x} len={len(raw)}")
                 msg = {"type": "audio", "data": raw, "format": "opus"}
             else:
                 msg = json.loads(raw)
@@ -271,14 +276,19 @@ class RobotWebSocketHandler:
             opus_data = base64.b64decode(opus_data)
         try:
             pcm = self._opus_decode(session, opus_data)
-            session.audio_buffer.append(pcm)
-            # Only reset EOS if this chunk contains actual speech
             silent, rms = _is_silence(pcm)
             if not silent:
+                # Speech detected — start/reset EOS, buffer this chunk
+                session.audio_buffer.append(pcm)
                 self._reset_eos(session)
+            elif session.audio_buffer:
+                # Silence after speech started — buffer as trailing context
+                session.audio_buffer.append(pcm)
+            # else: silence before any speech — discard (background noise)
             # Throttled log every 30 chunks
-            if len(session.audio_buffer) % 30 == 0:
-                logger.info(f"[WS] Audio #{len(session.audio_buffer)} chunks, "
+            chunk_count = len(session.audio_buffer)
+            if chunk_count > 0 and chunk_count % 30 == 0:
+                logger.info(f"[WS] Audio #{chunk_count} chunks, "
                            f"RMS={rms:.0f} silent={silent}, "
                            f"total={sum(len(c) for c in session.audio_buffer)}B")
         except Exception as e:
@@ -289,10 +299,12 @@ class RobotWebSocketHandler:
         import base64
         # Binary format: [0x02][len:4 BE][jpeg payload]
         if len(raw) < 5:
+            logger.warning(f"[WS] JPEG frame too short ({len(raw)} bytes)")
             return
         jpeg_data = raw[5:]
         if not jpeg_data:
             return
+        logger.info(f"[WS] JPEG frame received: {len(jpeg_data)} bytes")
         # Route to vision_frame handler using base64 wrapper
         msg = {
             "type": "vision_frame",
@@ -301,14 +313,27 @@ class RobotWebSocketHandler:
         await self._handle_vision_frame(session, msg)
 
     async def _start_camera(self, session: RobotSession):
-        """Send StartCameraStream binary command to ESP32."""
-        # DataType::StartCameraStream = 0x05, no payload
+        """Send StartCameraStream binary command to ESP32.
+        Falls back to IoT text command for newer firmware versions."""
+        import json
+        # Method 1: Binary StartCameraStream (DataType 0x05)
         packet = bytes([0x05, 0x00, 0x00, 0x00, 0x00])
         try:
             await session.websocket.send_bytes(packet)
-            logger.info("[WS] Camera stream started")
+            logger.info("[WS] Camera stream started (binary 0x05)")
         except Exception as e:
-            logger.error(f"[WS] Failed to start camera: {e}")
+            logger.error(f"[WS] Failed to start camera (binary): {e}")
+        
+        # Method 2: IoT text command (newer firmware)
+        try:
+            iot_cmd = json.dumps({
+                "type": "iot",
+                "commands": [{"name": "camera.on", "parameters": {"stream": True}}]
+            })
+            await session.websocket.send_text(iot_cmd)
+            logger.info("[WS] Camera stream IoT command sent")
+        except Exception as e:
+            logger.warning(f"[WS] IoT camera command failed: {e}")
 
     def _reset_eos(self, session: RobotSession):
         """Start/reset end-of-speech timer. Fires 1.5s after last speech chunk."""
@@ -351,7 +376,9 @@ class RobotWebSocketHandler:
                                       (320, 240))
             return
 
-        # Full frame — server-side detect + recognize
+        # Full frame — cache latest JPEG for see tool, then detect/recognize
+        session.last_jpeg = jpeg
+        logger.info(f"[WS] Vision frame cached ({len(jpeg)} bytes, face_crop={is_face_crop})")
         fw = msg.get("width", 320)
         fh = msg.get("height", 240)
         results = await vision_service.process_frame(jpeg)
@@ -393,9 +420,9 @@ class RobotWebSocketHandler:
             }))
 
     async def _eos_handler(self, session: RobotSession):
-        """After 1.5s of silence: run ASR, POST result to Hermes webhook."""
+        """After 1.0s of silence: run ASR, POST result to Hermes webhook."""
         try:
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(1.0)
             if session.is_listening and session.audio_buffer:
                 pcm_data = b"".join(session.audio_buffer)
                 logger.info(f"[WS] EOS — processing {len(pcm_data)}B from {len(session.audio_buffer)} chunks")
@@ -407,8 +434,13 @@ class RobotWebSocketHandler:
                     await self._send_json(session.websocket, {
                         "type": "stt", "text": text, "session_id": session.session_id,
                     })
-                    # POST to Hermes webhook — Agent handles everything via MCP tools
-                    asyncio.create_task(self._post_webhook(session, text))
+                    # Prevent double-trigger: skip if Hermes is already processing
+                    if session._webhook_pending:
+                        logger.info("[WS] Webhook pending — skipping duplicate ASR")
+                    else:
+                        session._webhook_pending = True
+                        self._start_rainbow(session)
+                        asyncio.create_task(self._post_webhook(session, text))
                 else:
                     logger.info("[WS] ASR: no speech detected")
                 session.is_listening = False
@@ -418,6 +450,7 @@ class RobotWebSocketHandler:
     async def _post_webhook(self, session: RobotSession, text: str):
         """POST ASR text to Hermes webhook. Hermes Agent drives the response."""
         import httpx
+
         try:
             async with httpx.AsyncClient(timeout=5) as client:
                 await client.post(
@@ -432,6 +465,7 @@ class RobotWebSocketHandler:
             logger.info(f"[Webhook] Sent: {text[:40]}")
         except Exception as e:
             logger.error(f"[Webhook] Failed: {e}")
+            session._webhook_pending = False
 
     # ── TTS streaming ──────────────────────────────────────────
 
@@ -449,10 +483,12 @@ class RobotWebSocketHandler:
             await self._send_json(session.websocket, {
                 "type": "tts", "state": "start", "session_id": session.session_id,
             })
-            self._stop_rainbow(session)
-            self._set_led(session, 0, 0, 168)  # Blue = speaking
         except Exception:
             return
+
+        # LED: Blue = speaking
+        self._stop_rainbow(session)
+        self._set_led(session, 0, 0, 168)
 
         # Single Opus encoder — reused across sentences to avoid reset artifacts
         encoder = opuslib.Encoder(OPUS_SR, OPUS_CHANNELS, 'voip')
@@ -466,19 +502,39 @@ class RobotWebSocketHandler:
                     logger.info("[WS] TTS stopped mid-stream")
                     return
 
+                # Sentence-level start event (for UI/progress display)
+                try:
+                    await self._send_json(session.websocket, {
+                        "type": "tts", "state": "sentence_start",
+                        "index": i, "text": sentence[:30],
+                        "session_id": session.session_id,
+                    })
+                except Exception:
+                    pass
+
                 frame_count += await self._tts_send_one(session, sentence, encoder)
+
+                try:
+                    await self._send_json(session.websocket, {
+                        "type": "tts", "state": "sentence_end",
+                        "index": i,
+                        "session_id": session.session_id,
+                    })
+                except Exception:
+                    pass
         except asyncio.CancelledError:
             pass
         except Exception as e:
             logger.error(f"[WS] TTS stream error: {e}")
         finally:
-            self._set_led(session, 0, 0, 0)
             try:
                 await self._send_json(session.websocket, {
                     "type": "tts", "state": "stop", "session_id": session.session_id,
                 })
             except Exception:
                 pass
+            session._webhook_pending = False
+            self._set_led(session, 0, 0, 0)  # LED off = idle
             logger.info(f"[WS] TTS sent: {frame_count} Opus frames, {len(sentences)} sentences")
 
     async def _tts_send_one(self, session: RobotSession, text: str, encoder) -> int:
@@ -668,23 +724,20 @@ class RobotWebSocketHandler:
 # ── helpers ────────────────────────────────────────────────────
 
 def _split_sentences(text: str) -> list[str]:
-    """Split Chinese text into sentences by punctuation, keeping separator."""
-    import re
-    parts = re.split(r'(?<=[。！？!?\n])', text)
-    result = [p.strip() for p in parts if p.strip()]
-    return result if result else [text]
+    """Split Chinese text into sentences with pause-fallback for long segments."""
+    from .sentence_split import split_sentences
+    return split_sentences(text, max_len=80)
 
 
-def _is_silence(pcm: bytes, threshold: int = 250) -> tuple[bool, float]:
-    """Check if 16-bit mono PCM is silence. Returns (is_silent, rms)."""
-    import array
-    if len(pcm) < 2:
-        return True, 0.0
-    samples = array.array('h', pcm)
-    if len(samples) == 0:
-        return True, 0.0
-    rms = (sum(s * s for s in samples) / len(samples)) ** 0.5
-    return rms < threshold, rms
+def _is_silence(pcm: bytes, sample_rate: int = 16000,
+                threshold_rms: int = 600, vad_mode: int = 2) -> tuple:
+    """Check if 16-bit mono PCM is silence using WebRTC VAD + RMS fallback.
+
+    Returns (is_silent, rms, vad_active) — 3-tuple.
+    Legacy callers that expect 2-tuple still work via unpacking: silent, rms = _is_silence(pcm).
+    """
+    from .vad import is_silence as _vad_is_silence
+    return _vad_is_silence(pcm, sample_rate, threshold_rms, vad_mode)
 
 
 ws_handler = RobotWebSocketHandler()

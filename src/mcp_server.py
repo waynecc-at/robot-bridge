@@ -198,9 +198,8 @@ class StackChanTools:
     async def tool_see(self) -> dict:
         """Take a photo from the robot's camera and return JPEG data."""
         await self.wait_ready()
-        session = self._get_active_session()
-        if not session:
-            return {"error": "No ESP32 device connected"}
+        if not self._get_active_session():
+            return await self._bridge_api("see")
 
         # Use MCP to request photo from ESP32
         try:
@@ -229,11 +228,9 @@ class StackChanTools:
         Returns face positions and recognized person identity.
         """
         await self.wait_ready()
+        if not self._get_active_session():
+            return await self._bridge_api("face")
         session = self._get_active_session()
-        if not session:
-            return {"error": "No ESP32 device connected"}
-
-        # Check if vision_service has processed a recent frame
         # The ESP32 sends vision_frame continuously at ~1fps
         # Vision service processes the latest frame
         if not config.vision.enabled:
@@ -268,9 +265,9 @@ class StackChanTools:
     async def tool_face_register(self, name: str, relationship: str = "") -> dict:
         """Register a new person using collected face crops from the current session."""
         await self.wait_ready()
+        if not self._get_active_session():
+            return await self._bridge_api("face_register", name=name, relationship=relationship)
         session = self._get_active_session()
-        if not session:
-            return {"error": "No ESP32 device connected"}
 
         # Get face crops collected by face_registry
         from .face_registry import face_registry as fr
@@ -517,7 +514,7 @@ async def handle_list_tools() -> list[Tool]:
         ),
         Tool(
             name="stackchan_look",
-            description="转头。让机器人把头转到指定角度。yaw 水平(-90~90), pitch 垂直(0~90), speed 速度(100~1000)。转头后自动暂停追踪 4 秒。",
+            description="转头。让机器人把头转到指定角度。yaw 水平(-90~90), pitch 垂直(0~90, 0=朝下, 45=平视, 90=朝上), speed 速度(100~1000)。转头后自动暂停追踪 4 秒。",
             inputSchema={
                 "type": "object",
                 "properties": {
