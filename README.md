@@ -38,10 +38,13 @@ MCP Server → HTTP :8081/internal/* → Bridge → ESP32
 - FunASR / Sherpa-ONNX 模型
 - FFmpeg
 
+> 想把 StackChan 硬件连上、但不确定 ESP32 该连到哪个地址？
+> 见 [docs/CONNECTING-STACKCHAN.md](docs/CONNECTING-STACKCHAN.md)（新增，回答 issue #1）。
+
 ### 安装
 
 ```bash
-git clone https://github.com/user/robot-bridge.git
+git clone https://github.com/waynecc-at/robot-bridge.git
 cd robot-bridge
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e .
