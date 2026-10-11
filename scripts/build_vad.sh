@@ -43,6 +43,8 @@ gcc -c -fPIC -DWEBRTC_POSIX \
   cbits/webrtc/common_audio/signal_processing/spl_init.c \
   cbits/webrtc/common_audio/signal_processing/vector_scaling_operations.c
 
-gcc -shared -o src/libwebrtcvad.so *.o
+gcc -shared -o "src/libwebrtcvad-$(uname -m).so" *.o
 rm -f *.o
-echo "Done: src/libwebrtcvad.so"
+echo "Done: src/libwebrtcvad-$(uname -m).so"
+echo "Note: the committed src/libwebrtcvad.so is left untouched; the loader"
+echo "prefers the arch-specific library produced here."

@@ -4,25 +4,63 @@ Drop-in replacement for the simple RMS-based silence detection.
 
 import ctypes
 import ctypes.util
+import platform
 from pathlib import Path
 
 _LIB = None
+
+
+def _candidate_paths():
+    """Bundled library paths to try, most specific first.
+
+    An architecture-suffixed build (e.g. ``libwebrtcvad-aarch64.so``) takes
+    precedence over the generic ``libwebrtcvad.so`` so a machine-native library
+    can coexist with the committed one. ``platform.machine()`` matches the
+    ``uname -m`` suffix written by ``scripts/build_vad.sh``.
+    """
+    lib_dir = Path(__file__).parent
+    arch = platform.machine()
+    return [
+        lib_dir / f"libwebrtcvad-{arch}.so",
+        lib_dir / "libwebrtcvad.so",
+    ]
 
 
 def _load_lib():
     global _LIB
     if _LIB is not None:
         return _LIB
-    lib_path = Path(__file__).parent / "libwebrtcvad.so"
-    if lib_path.exists():
-        _LIB = ctypes.CDLL(str(lib_path))
-    else:
-        path = ctypes.util.find_library("webrtcvad")
-        if path:
-            _LIB = ctypes.CDLL(path)
-        else:
-            raise RuntimeError("libwebrtcvad.so not found")
-    return _LIB
+
+    errors = []
+    for lib_path in _candidate_paths():
+        if not lib_path.exists():
+            continue
+        try:
+            _LIB = ctypes.CDLL(str(lib_path))
+            return _LIB
+        except OSError as exc:
+            # e.g. wrong CPU architecture: keep looking rather than crash.
+            errors.append(f"{lib_path}: {exc}")
+
+    system_path = ctypes.util.find_library("webrtcvad")
+    if system_path:
+        try:
+            _LIB = ctypes.CDLL(system_path)
+            return _LIB
+        except OSError as exc:
+            errors.append(f"{system_path}: {exc}")
+
+    arch = platform.machine()
+    detail = "; ".join(errors) if errors else "no bundled library present"
+    raise RuntimeError(
+        f"Could not load the WebRTC VAD shared library for architecture "
+        f"'{arch}'. Tried 'libwebrtcvad-{arch}.so', 'libwebrtcvad.so', and the "
+        f"system 'webrtcvad'. The committed 'libwebrtcvad.so' is a prebuilt "
+        f"binary that may target a different architecture than '{arch}'. "
+        f"Build a native library with "
+        f"'bash scripts/build_vad.sh' (needs gcc + make), which produces "
+        f"'libwebrtcvad-{arch}.so' next to this module. [{detail}]"
+    )
 
 
 class WebRtcVad:
@@ -81,7 +119,7 @@ class WebRtcVad:
         return bool(result)
 
     def close(self):
-        if self._handle:
+        if getattr(self, "_handle", None):
             self._lib.WebRtcVad_Free.argtypes = [ctypes.c_void_p]
             self._lib.WebRtcVad_Free(self._handle)
             self._handle = None
