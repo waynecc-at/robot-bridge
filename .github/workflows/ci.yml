@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Minimal, hardware-free CI.
+#
+# The robot-bridge test suite as committed cannot run in CI: most files need a
+# live bridge process, a real Hermes/ASR/TTS backend, or the heavy ML stack
+# (torch / funasr / sherpa-onnx / opencv). The files that import and run without
+# any of that are selected explicitly below. See the pull request for the full
+# included/excluded list and the raw local output backing this workflow.
+
+jobs:
+  hardware-free-tests:
+    name: Hardware-free tests (no torch/funasr/sherpa/opencv)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # pyproject.toml declares requires-python = ">=3.10".
+          # (README says 3.12+, which disagrees; 3.11 satisfies pyproject.)
+          python-version: "3.11"
+
+      - name: Install system library for opuslib
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libopus0
+
+      - name: Install light test dependencies
+        # Only the packages the selected checks import. Deliberately NOT
+        # installing torch / funasr / sherpa-onnx / opencv-python-headless.
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            "loguru>=0.7.0" \
+            "numpy>=1.26.0" \
+            "scipy" \
+            "pydantic>=2.5.0" \
+            "pyyaml>=6.0" \
+            "opuslib>=3.0.0"
+
+      - name: Import smoke (hardware-free modules)
+        run: |
+          python - <<'PY'
+          import importlib
+
+          modules = [
+              "src.metrics",
+              "src.config",
+              "src.text_utils",
+              "src.sentence_split",
+              "src.wav_utils",
+              "src.asr_service",
+              "src.tts_service",
+              "src.face_registry",
+              "src.face_tracker",
+              "src.profile_store",
+              "src.vision_service",
+              "src.websocket_handler",
+              "src.vad",
+          ]
+          for name in modules:
+              importlib.import_module(name)
+              print(f"  ok  {name}")
+          print(f"{len(modules)} hardware-free modules imported")
+          PY
+
+      - name: Run hardware-free test module
+        # tests/benchmark_pipeline.py is the only file under tests/ that runs
+        # with no live bridge, no network and no ML models (stdlib + loguru).
+        run: python tests/benchmark_pipeline.py
